@@ -1,3 +1,4 @@
+import pickle
 from typing import Any, Optional
 
 import pytest
@@ -183,3 +184,9 @@ class BaseEmbeddingsTest:
     def test_embeddings_load_in_eval_mode(self):
         embeddings = self.create_embedding_with_args(self.default_args)
         assert not embeddings.training
+
+    def test_serializable(self):
+        embeddings = self.create_embedding_with_args(self.default_args)
+        serialized = pickle.dumps(embeddings)
+        deserialized = pickle.loads(serialized)
+        assert deserialized is not None

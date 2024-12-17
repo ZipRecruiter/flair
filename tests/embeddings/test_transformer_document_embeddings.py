@@ -3,7 +3,7 @@ import pytest
 from flair.data import Dictionary, Sentence
 from flair.embeddings import TransformerDocumentEmbeddings
 from flair.models import TextClassifier
-from flair.nn import Classifier
+from flair.nn import Classifier, LabelVerbalizerDecoder
 from tests.embedding_test_utils import BaseEmbeddingsTest
 
 
@@ -39,6 +39,19 @@ def test_if_loaded_embeddings_have_all_attributes(tasks_base_path):
     # check that context_length and use_context_separator is the same for both
     assert model.embeddings.context_length == loaded_single_task.embeddings.context_length
     assert model.embeddings.use_context_separator == loaded_single_task.embeddings.use_context_separator
+
+
+def test_loading_complex_models(tasks_base_path):
+    embeddings = TransformerDocumentEmbeddings("distilbert-base-uncased")
+    model = TextClassifier(
+        label_type="ner",
+        label_dictionary=Dictionary(),
+        embeddings=embeddings,
+        decoder=LabelVerbalizerDecoder(embeddings, Dictionary()),
+    )
+    model.save(tasks_base_path / "single.pt")
+    loaded_embeddings = Classifier.load(tasks_base_path / "single.pt")
+    assert loaded_embeddings is not None
 
 
 @pytest.mark.parametrize("cls_pooling", ["cls", "mean", "max"])
