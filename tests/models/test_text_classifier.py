@@ -43,7 +43,7 @@ class TestTextClassifier(BaseModelTest):
         flair.set_seed(123)
         label_dict = corpus.make_label_dictionary(label_type=self.train_label_type)
 
-        model = self.model_cls(embeddings=embeddings, label_dictionary=label_dict, label_type=self.train_label_type)
+        model = self.model_cls(embeddings=embeddings, label_dictionary=label_dict, label_type=self.train_label_type, loss_weights={"neg": 1.0, "pos": 1.0})
 
         trainer = ModelTrainer(model, corpus)
         trainer.train(results_base_path, max_epochs=2, shuffle=False, sampler=ImbalancedClassificationDatasetSampler)
