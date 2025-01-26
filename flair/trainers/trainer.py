@@ -772,6 +772,7 @@ class ModelTrainer(Pluggable):
                             embedding_storage_mode=embeddings_storage_mode,
                             gold_label_type=self.model.label_type,
                             gold_label_dictionary_for_eval=gold_label_dictionary_for_eval,
+                            multi_gpu=multi_gpu,
                         )
 
                         # log results
@@ -874,6 +875,7 @@ class ModelTrainer(Pluggable):
                     gold_label_dictionary=gold_label_dictionary_for_eval,
                     exclude_labels=exclude_labels,
                     return_loss=False,
+                    multi_gpu=multi_gpu,
                 )
 
                 log.info(test_results.detailed_results)

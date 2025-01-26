@@ -2,7 +2,7 @@ import logging
 import os
 import random
 from multiprocessing.connection import Connection
-from typing import Callable
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import torch
@@ -15,8 +15,10 @@ from flair.data import Corpus, _len_dataset
 
 log = logging.getLogger("flair")
 
+T = TypeVar("T")
 
-def launch_distributed(fn, *args, **kwargs):
+
+def launch_distributed(fn: Callable, *args, **kwargs):
     """Executes the function fn(*args, **kwargs) on multiple processes (one for each local GPU).
 
     If training with multi_gpu=True, launch_distributed should wrap your code that calls .train or .fine_tune.
@@ -61,7 +63,14 @@ def is_main_process() -> bool:
         return True
 
 
-def aggregate(value, aggregation_fn=np.mean):
+def gather(value: T) -> list[T]:
+    """Gather `value` from all processes and return a list of values."""
+    gathered_values = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_values, value)
+    return gathered_values
+
+
+def aggregate(value: Any, aggregation_fn: Callable = np.mean):
     """Gather `value` from all processes and send to `aggregation_fn` to get a single return value."""
     if torch.distributed.is_initialized():
         gathered_values = [None for _ in range(torch.distributed.get_world_size())]
@@ -69,6 +78,16 @@ def aggregate(value, aggregation_fn=np.mean):
     else:
         gathered_values = [value]
     return aggregation_fn(gathered_values)
+
+
+def broadcast_value(value: T, src: int = 0) -> T:
+    """
+    Broadcasts a Python object from the source process (src) to all other processes.
+    Every process returns the same object.
+    """
+    obj_list = [value]
+    torch.distributed.broadcast_object_list(obj_list, src=src)
+    return obj_list[0]
 
 
 def validate_corpus_same_each_process(corpus: Corpus) -> None:
@@ -87,3 +106,29 @@ def _validate_dataset_same_each_process(dataset: Dataset, sample_size: int = 10)
         examples = aggregate(example, list)
         if not all(example == examples[0] for example in examples):
             raise ValueError("Dataset must be the same on each process")
+
+
+# aggregation functions
+def flatten(l: list[list[str]]) -> list[str]:
+    return [x for s in l for x in s]
+
+
+def flatten_sets(list_of_sets: list[list[str]]) -> set[str]:
+    return {x for subset in list_of_sets for x in subset}
+
+
+def flatten_dicts(list_of_dicts: list[dict[str, list[str]]]) -> dict[str, list[str]]:
+    merged_dict = {}
+    for d in list_of_dicts:
+        for k, v in d.items():
+            if k not in merged_dict:
+                merged_dict[k] = []
+            merged_dict[k].extend(v)
+    return merged_dict
+
+
+def merge_sets(list_of_sets: list[set[str]]) -> set[str]:
+    merged_set = set()
+    for s in list_of_sets:
+        merged_set.update(s)
+    return merged_set
