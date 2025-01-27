@@ -252,62 +252,6 @@ class ReduceTransformerVocabMixin(ABC):
     ) -> typing.Iterable[list[str]]:
         pass
 
-TupleSpanDicts = tuple[set[str], dict[str, list[str]], dict[str, list[str]]]
-YDataTuple = tuple[list[int], list[int], set[str]]
-
-def merge_span_dicts(list_of_tuples: list[TupleSpanDicts]) -> TupleSpanDicts:
-    """
-    list_of_tuples is the result of all_gather_object, so it’s a list
-    containing one entry from each process:
-        [
-          (all_spans_proc0, all_true_values_proc0, all_pred_values_proc0),
-          (all_spans_proc1, all_true_values_proc1, all_pred_values_proc1),
-          ...
-        ]
-    We want to return a single (merged_spans, merged_true_dict, merged_pred_dict).
-    """
-    merged_spans = set()
-    merged_true_values = {}
-    merged_pred_values = {}
-
-    for (spans, true_dict, pred_dict) in list_of_tuples:
-        # 1) Merge the sets
-        merged_spans.update(spans)
-
-        # 2) Merge the true dict
-        for span_key, gold_labels in true_dict.items():
-            if span_key not in merged_true_values:
-                merged_true_values[span_key] = []
-            # extend the list with partial gold labels from the local process
-            merged_true_values[span_key].extend(gold_labels)
-
-        # 3) Merge the predicted dict
-        for span_key, pred_labels in pred_dict.items():
-            if span_key not in merged_pred_values:
-                merged_pred_values[span_key] = []
-            merged_pred_values[span_key].extend(pred_labels)
-
-    return merged_spans, merged_true_values, merged_pred_values
-
-
-def merge_y_data(list_of_tuples: list[YDataTuple]) -> YDataTuple:
-    """
-    Each element in list_of_tuples is (local_y_true, local_y_pred, local_target_names)
-    from a single process. We merge them into one global (y_true, y_pred, target_names).
-    """
-    merged_y_true = []
-    merged_y_pred = []
-    merged_target_names = set()
-
-    for (proc_y_true, proc_y_pred, proc_target_names) in list_of_tuples:
-        merged_y_true.extend(proc_y_true)
-        merged_y_pred.extend(proc_y_pred)
-        merged_target_names.update(proc_target_names)
-
-    # Convert target_names set back to a list (and optionally sort)
-    merged_target_names = sorted(list(merged_target_names))
-    return merged_y_true, merged_y_pred, merged_target_names
-
 
 class Classifier(Model[DT], typing.Generic[DT], ReduceTransformerVocabMixin, ABC):
     """Abstract base class for all Flair models that do classification.
