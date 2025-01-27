@@ -92,7 +92,7 @@ def gather(value: T) -> list[T]:
     return gathered_values
 
 
-def aggregate(value: T, aggregation_fn: Callable = np.mean) -> list[T]:
+def aggregate(value: T, aggregation_fn: Callable):
     """Gather `value` from all processes and send to `aggregation_fn` to get a single return value."""
     gathered_values = gather(value)
     return aggregation_fn(gathered_values)

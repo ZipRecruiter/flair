@@ -19,7 +19,8 @@ import flair
 from flair.class_utils import get_non_abstract_subclasses
 from flair.data import DT, DT2, Corpus, Dictionary, Sentence, _iter_dataset
 from flair.datasets import DataLoader, FlairDatapointDataset
-from flair.distributed_utils import aggregate, broadcast_value, flatten_dicts, gather, is_main_process, merge_sets
+from flair.distributed_utils import aggregate, aggregate_tensor_sum, broadcast_value, flatten_dicts, is_main_process, \
+    merge_sets
 from flair.embeddings import Embeddings
 from flair.embeddings.base import load_embeddings
 from flair.file_utils import Tqdm, load_torch_state
@@ -84,7 +85,6 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
         Returns:
             The evaluation results.
         """
-        exclude_labels = exclude_labels if exclude_labels is not None else []
         raise NotImplementedError
 
     def _get_state_dict(self) -> dict:
@@ -383,17 +383,17 @@ class Classifier(Model[DT], typing.Generic[DT], ReduceTransformerVocabMixin, ABC
 
         t2 = time()
         print('time2', t2 - t1)
+        print('eval losssss', type(eval_loss), eval_loss)
         if multi_gpu:
             all_spans = aggregate(all_spans, merge_sets)
             all_true_values = aggregate(all_true_values, flatten_dicts)
             all_predicted_values = aggregate(all_predicted_values, flatten_dicts)
             average_over = aggregate(average_over, sum)
-            eval_losses = gather(eval_loss)
-            eval_loss = sum(l.cpu() for l in eval_losses)
-        print('eval loss =', eval_loss)
+            eval_loss = aggregate(eval_loss, aggregate_tensor_sum)
+            print('eval loss =', eval_loss)
         print('len all', len(all_spans), len(all_true_values), len(all_predicted_values), sep='\t')
 
-        result = None
+        result = Result(0., "", {}, {'loss': 0.0})
         if is_main_process():
 
             # convert true and predicted values to two span-aligned lists
@@ -475,10 +475,8 @@ class Classifier(Model[DT], typing.Generic[DT], ReduceTransformerVocabMixin, ABC
                 target_names.append(label_name)
                 labels.append(evaluation_label_dictionary.get_idx_for_item(label_name))
 
-            y_true_save = y_true
-            print(f"{len(data_points)}\t{len(y_true_save)}\n{len(y_true)}\t{len(y_pred)}\t{len(target_names)}\t{len(labels)}")
+            #print(f"{len(data_points)}\t{len(y_true_save)}\n{len(y_true)}\t{len(y_pred)}\t{len(target_names)}\t{len(labels)}")
 
-            #if is_main_process():
             # there is at least one gold label or one prediction (default)
             if len(all_true_values) + len(all_predicted_values) > 1:
                 classification_report = sklearn.metrics.classification_report(
