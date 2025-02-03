@@ -862,7 +862,7 @@ class DefaultClassifier(Classifier[DT], typing.Generic[DT, DT2], ABC):
 
             overall_loss = torch.zeros(1, device=flair.device)
             label_count = 0
-            has_any_unknown_label = False
+            has_any_unknown_label = set()
             for batch in batches:
                 # filter data points in batch
                 batch = [dp for dp in batch if self._filter_data_point(dp)]
@@ -890,15 +890,22 @@ class DefaultClassifier(Classifier[DT], typing.Generic[DT, DT2], ABC):
                     if return_loss:
                         # filter data points that have labels outside of dictionary
                         filtered_indices = []
-                        has_unknown_label = False
+                        has_unknown_label = []
                         for idx, dp in enumerate(data_points):
                             if all(self.label_dictionary.has_item(label) for label in self._get_label_of_datapoint(dp)):
                                 filtered_indices.append(idx)
                             else:
-                                has_unknown_label = True
+                                has_unknown_label.append(dp)
 
                         if has_unknown_label:
-                            has_any_unknown_label = True
+                            has_any_unknown_label.update(
+                                [
+                                    label.value
+                                    for dp in has_unknown_label
+                                    for label in dp.get_labels()
+                                    if not self.label_dictionary.has_item(label.value)
+                                ]
+                            )
                             scores = torch.index_select(
                                 scores, 0, torch.tensor(filtered_indices, device=flair.device, dtype=torch.int32)
                             )
@@ -946,8 +953,8 @@ class DefaultClassifier(Classifier[DT], typing.Generic[DT, DT2], ABC):
             if return_loss:
                 if has_any_unknown_label:
                     log.info(
-                        "During evaluation, encountered labels that are not in the label_dictionary:"
-                        "Evaluation loss is computed without them."
+                        "During evaluation, encountered labels that are not in the label_dictionary:\n"
+                        f"{has_any_unknown_label}\n{self.label_dictionary.get_items()}"
                     )
                 return overall_loss, label_count
             return None
