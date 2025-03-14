@@ -94,7 +94,7 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
 
     def _get_state_dict(self) -> dict:
         """Returns the state dictionary for this model.
-        
+
         The state dictionary contains:
         - "state_dict": The model's parameters state dictionary
         - "__cls__": The class name of the model for loading
@@ -103,18 +103,15 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
         - "model_card": Training parameters and metadata (if set)
         """
         # Always include the name of the Model class for which the state dict holds
-        state_dict = {
-            "state_dict": self.state_dict(), 
-            "__cls__": self.__class__.__name__
-        }
+        state_dict = {"state_dict": self.state_dict(), "__cls__": self.__class__.__name__}
 
         # Add optimizer state dict if it exists
-        if hasattr(self, 'optimizer_state_dict') and self.optimizer_state_dict is not None:
+        if hasattr(self, "optimizer_state_dict") and self.optimizer_state_dict is not None:
             print("Found optimizer state dict in model, adding to state")
             state_dict["optimizer_state_dict"] = self.optimizer_state_dict
-        
+
         # Add scheduler state dict if it exists
-        if hasattr(self, 'scheduler_state_dict') and self.scheduler_state_dict is not None:
+        if hasattr(self, "scheduler_state_dict") and self.scheduler_state_dict is not None:
             print("Found scheduler state dict in model, adding to state")
             state_dict["scheduler_state_dict"] = self.scheduler_state_dict
 
@@ -168,7 +165,7 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
             checkpoint: This parameter is currently unused.
         """
         model_state = self._get_state_dict()
-                
+
         # write out a "model card" if one is set
         if self.model_card is not None:
             model_state["model_card"] = self.model_card
@@ -285,7 +282,7 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
             if "optimizer_state_dict" in state:
                 log.debug(f"Found optimizer state in model file with keys: {state['optimizer_state_dict'].keys()}")
                 model.optimizer_state_dict = state["optimizer_state_dict"]
-            
+
             # load scheduler state if it exists
             if "scheduler_state_dict" in state:
                 log.debug(f"Found scheduler state in model file with keys: {state['scheduler_state_dict'].keys()}")
