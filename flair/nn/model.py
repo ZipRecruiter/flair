@@ -130,10 +130,12 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
 
         # load optimizer state if it exists in the state dict
         if "optimizer_state_dict" in state:
+            log.debug(f"Found optimizer state in model file with keys: {state['optimizer_state_dict'].keys()}")
             model.optimizer_state_dict = state["optimizer_state_dict"]
 
         # load scheduler state if it exists in the state dict
         if "scheduler_state_dict" in state:
+            log.debug(f"Found scheduler state in model file with keys: {state['scheduler_state_dict'].keys()}")
             model.scheduler_state_dict = state["scheduler_state_dict"]
 
         return model
@@ -275,16 +277,6 @@ class Model(torch.nn.Module, typing.Generic[DT], ABC):
             else:
                 log.info("- Model license: No license information available")
             log.info("--------------------------------------------------")
-
-            # load optimizer state if it exists in the state dict
-            if "optimizer_state_dict" in state:
-                log.debug(f"Found optimizer state in model file with keys: {state['optimizer_state_dict'].keys()}")
-                model.optimizer_state_dict = state["optimizer_state_dict"]
-
-            # load scheduler state if it exists in the state dict
-            if "scheduler_state_dict" in state:
-                log.debug(f"Found scheduler state in model file with keys: {state['scheduler_state_dict'].keys()}")
-                model.scheduler_state_dict = state["scheduler_state_dict"]
 
             model.eval()
             model.to(flair.device)
