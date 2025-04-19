@@ -148,6 +148,7 @@ class DeepNCMDecoder(torch.nn.Module):
         alpha: float = 0.9,
         mean_update_method: Literal["online", "condensation", "decay"] = "online",
         multi_label: bool = False,  # should get from the Model it belongs to
+        store_prototypes_on_cpu: bool = False,
     ) -> None:
         """Initialize a DeepNCMDecoder.
 
@@ -162,6 +163,7 @@ class DeepNCMDecoder(torch.nn.Module):
                 condensation -
                 decay - after every batch,
             multi_label: Whether to predict multiple labels per sentence (default is False, and performs multi-class clsasification).
+            store_prototypes_on_cpu: Whether to store the class prototypes on CPU (default is False, and stores them on the same device as the model).
         """
         super().__init__()
 
@@ -182,7 +184,7 @@ class DeepNCMDecoder(torch.nn.Module):
 
         self.class_prototypes = torch.nn.Parameter(
             torch.nn.functional.normalize(torch.randn(self._num_prototypes, self.encoding_dim)), requires_grad=False
-        )
+        ).to('cpu' if store_prototypes_on_cpu else flair.device)
 
         self.class_counts = torch.nn.Parameter(torch.zeros(self._num_prototypes), requires_grad=False)
         self.prototype_updates = torch.zeros_like(self.class_prototypes).to(flair.device)
@@ -249,23 +251,24 @@ class DeepNCMDecoder(torch.nn.Module):
     def update_prototypes(self) -> None:
         """Apply accumulated updates to class prototypes."""
         with torch.no_grad():
-            update_mask = self.prototype_update_counts > 0
-            if update_mask.any():
+            update_indices = torch.nonzero(self.prototype_update_counts > 0).squeeze()
+            if len(update_indices) > 0:
+                batch_prototypes = self.class_prototypes[update_indices].to(flair.device)
                 if self.mean_update_method in ["online", "condensation"]:
-                    new_counts = self.class_counts[update_mask] + self.prototype_update_counts[update_mask]
-                    self.class_prototypes[update_mask] = (
-                        self.class_counts[update_mask].unsqueeze(1) * self.class_prototypes[update_mask]
-                        + self.prototype_updates[update_mask]
+                    new_counts = (self.class_counts[update_indices] + self.prototype_update_counts[update_indices]).to(flair.device)
+                    self.class_prototypes[update_indices] = (
+                        self.class_counts[update_indices].unsqueeze(1).to(flair.device) * batch_prototypes
+                        + self.prototype_updates[update_indices].to(flair.device)
                     ) / new_counts.unsqueeze(1)
-                    self.class_counts[update_mask] = new_counts
+                    self.class_counts[update_indices] = new_counts.to('cpu')
                 elif self.mean_update_method == "decay":
-                    new_prototypes = self.prototype_updates[update_mask] / self.prototype_update_counts[
-                        update_mask
+                    new_prototypes = batch_prototypes / self.prototype_update_counts[
+                        update_indices
                     ].unsqueeze(1)
-                    self.class_prototypes[update_mask] = (
-                        self.alpha * self.class_prototypes[update_mask] + (1 - self.alpha) * new_prototypes
+                    self.class_prototypes[update_indices] = (
+                        self.alpha * batch_prototypes + (1 - self.alpha) * new_prototypes
                     )
-                    self.class_counts[update_mask] += self.prototype_update_counts[update_mask]
+                    self.class_counts[update_indices] += self.prototype_update_counts[update_indices]
 
             # Reset prototype updates
             self.prototype_updates = torch.zeros_like(self.class_prototypes, device=flair.device)
