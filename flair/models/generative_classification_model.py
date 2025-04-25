@@ -249,7 +249,7 @@ class GenerativeClassifier(Classifier):
                 "Consider choosing a different separator or modifying the affected labels."
             )
 
-        self.causal_model = causal_model
+        self.causal_model = causal_model.to(flair.device)
         self.label_dictionary = label_dictionary
         self.tokenizer = tokenizer
         self.tokenizer.padding_side = "left"  # decoder-only models require left padding for batched generation
