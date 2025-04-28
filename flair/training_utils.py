@@ -6,15 +6,18 @@ from enum import Enum
 from functools import reduce
 from math import inf
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Union
+from typing import Literal, NamedTuple, Optional, Union, Tuple
 
 from numpy import ndarray
+import torch
+from transformers import AutoModelForCausalLM
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from torch.optim import Optimizer
 from torch.utils.data import Dataset
 
-import flair
+from flair.data import DT, Dictionary, Sentence, Token, _iter_dataset
+from flair.embeddings import TransformerEmbeddings
 from flair.class_utils import StringLike
 from flair.data import DT, Dictionary, Sentence, Token, _iter_dataset
 
@@ -524,3 +527,95 @@ def create_labeled_sentence_from_entity_offsets(
         token_entities = [entity for entity in token_entities if entity.end_token_idx <= token_limit]
 
     return create_labeled_sentence_from_tokens(tokens, token_entities)
+
+
+def load_model_components(
+    model_name: str,
+    fine_tune: bool = False,
+    trust_remote_code: bool = False,
+    use_flair_embedding: bool = True,
+    is_document_embedding: bool = True,
+    is_token_embedding: bool = False,
+    cls_pooling: str = "mean",
+    device_map: Optional[str] = None,
+) -> Tuple[
+    Optional[TransformerEmbeddings],
+    AutoModelForCausalLM,
+]:
+    """Load a pre-trained causal language model, optionally wrapping it in a Flair TransformerEmbeddings.
+    This function also handles device placement and weight tying between the causal model and the embeddings to support multitask training.
+
+    Args:
+        model_name: The name of the pre-trained model to load.
+        fine_tune: If True, the weights of the transformers embedding will be updated during training.
+        trust_remote_code: If True, allows loading models from external sources (Huggingface).
+        use_flair_embedding: If True, loads a Flair TransformerEmbeddings wrapper.
+        is_document_embedding: If True, this embeddings can be handled document-embeddings.
+        is_token_embedding: If True, this embeddings can be handled as token-embeddings.
+        cls_pooling: Specify how the document-embeddings will be extracted.
+        device_map: Device placement for the model. Defaults to None (auto-detect).
+
+    Returns:
+        A tuple containing the Flair TransformerEmbeddings (if `use_flair_embedding` is True) and the causal model.
+    """
+    if device_map is None and torch.cuda.is_available():
+        device_map = "auto"
+
+    logger.info(f"Loading causal model from '{model_name}' (trust_remote_code={trust_remote_code})")
+    try:
+        causal_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            device_map=device_map,
+        )
+        logger.info("Causal model loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load causal model '{model_name}': {e}")
+        raise
+
+    flair_embedding = None
+    if use_flair_embedding:
+        logger.info(f"Loading Flair TransformerEmbeddings for '{model_name}'")
+        try:
+            flair_embedding = TransformerEmbeddings(
+                model_name,
+                fine_tune=fine_tune,
+                trust_remote_code=trust_remote_code,
+                is_document_embedding=is_document_embedding,
+                is_token_embedding=is_token_embedding,
+                cls_pooling=cls_pooling,
+            )
+            logger.info("Flair TransformerEmbeddings loaded.")
+        except Exception as e:
+            logger.error(f"Failed to load TransformerEmbeddings for '{model_name}': {e}")
+            raise
+
+        # tie the shared weights
+        tied = False
+        for attr in ("base_model", "model", "transformer"):
+            if hasattr(causal_model, attr):
+                try:
+                    flair_embedding.model = getattr(causal_model, attr)
+                    logger.info(f"Tied flair_embedding.model to causal_model.{attr}")
+                    tied = True
+                except Exception as tie_err:
+                    logger.warning(f"Weight tying via '{attr}' failed: {tie_err}")
+                break
+        if not tied:
+            logger.warning(
+                "Could not find any of 'base_model', 'model', or 'transformer' in causal_model; skipping weight tying."
+            )
+
+        # disable use_cache for safe multitask training
+        if hasattr(flair_embedding.model.config, "use_cache"):
+            flair_embedding.model.config.use_cache = False
+            logger.info("Disabled use_cache on flair_embedding.model.config")
+
+        if hasattr(flair_embedding.model.config, "output_hidden_states"):
+            flair_embedding.model.config.output_hidden_states = True
+            logger.info("Enabled output_hidden_states on flair_embedding.model.config")
+
+        flair_embedding.model_name = model_name
+
+    logger.info("Model components ready.")
+    return flair_embedding, causal_model
