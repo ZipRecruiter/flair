@@ -9,6 +9,8 @@ from inspect import signature
 from pathlib import Path
 from typing import Optional, Union
 import math
+import boto3
+import pickle
 
 import numpy as np
 import torch
@@ -38,7 +40,7 @@ from flair.trainers.plugins import (
     WeightExtractorPlugin,
 )
 from flair.training_utils import EmbeddingStorageMode, identify_dynamic_embeddings, log_line, store_embeddings
-from flair.trainers.dynamic_batch_size_samplers import SingleLengthBatchSampler
+from flair.trainers.dynamic_batch_size_samplers import SingleLengthSingleTaskBatchSampler, SingleLengthSingleTaskAdaptiveBatchSampler, SingleTaskBatchSampler, SingleTaskAdaptiveBatchSampler
 
 log = logging.getLogger("flair")
 
@@ -609,6 +611,17 @@ class ModelTrainer(Pluggable):
                 total_train_samples = 0
                 batch_count = 0
 
+                task_ids = train_data.ids
+                prev_dev_micro_f1 = {task_id: 0 for task_id in task_ids}
+                
+                try:
+                    s3_client = boto3.client("s3")
+                    prev_dev_micro_f1_file_name = f"{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl"
+                    prev_dev_micro_f1 = pickle.loads(s3_client.get_object(Bucket=sampler_cache_s3_bucket, Key=prev_dev_micro_f1_file_name)['Body'].read())
+                    log.warning(f"Load prev_dev_micro_f1 from s3://{sampler_cache_s3_bucket}/{prev_dev_micro_f1_file_name}")
+                except:
+                    pass
+                
                 for epoch in range(epoch + 1, max_epochs + 1):
                     log_line(log)
 
@@ -624,22 +637,72 @@ class ModelTrainer(Pluggable):
                     if not shuffle_first_epoch and epoch == 1:
                         shuffle_data_this_epoch = False
 
+                    # ----------------------------------------
+                    # Basic
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_size=mini_batch_size,
+                    #     shuffle=shuffle_data_this_epoch,
+                    #     sampler=sampler,
+                    # )
+                    # ----------------------------------------
+                    # max_tokens_per_batch_step = 4096
+                    # max_sentences_per_batch_step = 64
+                    # min_sentences_per_batch_step = 8
+                    # sampler = SingleLengthSingleTaskBatchSampler(
+                    #     max_tokens_per_batch_step=max_tokens_per_batch_step,
+                    #     max_sentences_per_batch_step=max_sentences_per_batch_step,
+                    #     min_sentences_per_batch_step=min_sentences_per_batch_step,
+                    #     skip_ratio=None
+                    # )
+                    # sampler.set_dataset(train_data, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
                     max_tokens_per_batch_step = 4096
                     max_sentences_per_batch_step = 64
                     min_sentences_per_batch_step = 8
-
-                    sampler = SingleLengthBatchSampler(
+                    skip_ratio = 0.8
+                    sampler = SingleLengthSingleTaskAdaptiveBatchSampler(
                         max_tokens_per_batch_step=max_tokens_per_batch_step,
                         max_sentences_per_batch_step=max_sentences_per_batch_step,
                         min_sentences_per_batch_step=min_sentences_per_batch_step,
-                        skip_ratio=None
+                        skip_ratio=skip_ratio
                     )
-                    sampler.set_dataset(train_data, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    sampler.set_dataset(train_data, prev_dev_micro_f1, sampler_cache_s3_bucket, sampler_cache_s3_folder)
                     sampler.set_epoch(epoch)
                     batch_loader = DataLoader(
                         train_data,
                         batch_sampler=sampler
                     )
+                    # ----------------------------------------
+                    # sampler = SingleTaskBatchSampler(
+                    #     mini_batch_chunk_size=2,
+                    #     shuffle=True,
+                    #     seed=0
+                    # )
+                    # sampler.set_dataset(train_data, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
+                    # sampler = SingleTaskAdaptiveBatchSampler(
+                    #     mini_batch_chunk_size=2,
+                    #     shuffle=True,
+                    #     seed=0
+                    # )
+                    # sampler.set_dataset(train_data, prev_dev_micro_f1, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
 
                     self.model.train()
 
@@ -800,6 +863,16 @@ class ModelTrainer(Pluggable):
                             gold_label_dictionary_for_eval=gold_label_dictionary_for_eval,
                             multi_gpu=multi_gpu,
                         )
+
+                        if evaluation_split == "dev":
+                            for task_id in task_ids:
+                                prev_dev_micro_f1[task_id] = eval_result.classification_report[task_id]['micro avg']['f1-score']
+
+                            if is_main_process():
+                                s3_resource = boto3.resource("s3")
+                                pickle_bytes = pickle.dumps(prev_dev_micro_f1)
+                                s3_resource.Object(sampler_cache_s3_bucket, f"{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl").put(Body=pickle_bytes)
+                                log.warning(f"Dump prev_dev_micro_f1 to s3://{sampler_cache_s3_bucket}/{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl")
 
                         # log results
                         log.info(
