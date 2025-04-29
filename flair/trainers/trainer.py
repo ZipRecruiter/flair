@@ -476,7 +476,7 @@ class ModelTrainer(Pluggable):
 
         # determine how to determine best model and whether to save it
         determine_best_epoch_using_dev_score = not train_with_dev and self.corpus.dev
-        best_epoch_score = 0 if determine_best_epoch_using_dev_score else float("inf")
+        self.best_epoch_score = 0 if determine_best_epoch_using_dev_score else float("inf")
         save_best_model = not train_with_dev and not use_final_model_for_eval
 
         # instantiate the optimizer
@@ -804,17 +804,17 @@ class ModelTrainer(Pluggable):
                         if determine_best_epoch_using_dev_score and evaluation_split == "dev":
                             validation_scores = eval_result.main_score, eval_result.loss
 
-                            if eval_result.main_score > best_epoch_score:
+                            if eval_result.main_score > self.best_epoch_score:
                                 current_epoch_has_best_model_so_far = True
-                                best_epoch_score = eval_result.main_score
+                                self.best_epoch_score = eval_result.main_score
 
                     # if not using DEV score, determine best model using train loss
                     if not determine_best_epoch_using_dev_score:
                         validation_scores = (train_loss,)
 
-                        if train_loss < best_epoch_score:
+                        if train_loss < self.best_epoch_score:
                             current_epoch_has_best_model_so_far = True
-                            best_epoch_score = train_loss
+                            self.best_epoch_score = train_loss
 
                     # - LossFilePlugin -> somehow prints all relevant metrics
                     # - AnnealPlugin -> scheduler step
