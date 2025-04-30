@@ -538,6 +538,7 @@ def load_model_components(
     is_token_embedding: bool = False,
     cls_pooling: str = "mean",
     device_map: Optional[str] = None,
+    transformer_embeddings_kwargs: Optional[dict] = None,
 ) -> Tuple[
     Optional[TransformerEmbeddings],
     AutoModelForCausalLM,
@@ -584,6 +585,7 @@ def load_model_components(
                 is_document_embedding=is_document_embedding,
                 is_token_embedding=is_token_embedding,
                 cls_pooling=cls_pooling,
+                **(transformer_embeddings_kwargs if transformer_embeddings_kwargs else {}),
             )
             logger.info("Flair TransformerEmbeddings loaded.")
         except Exception as e:
