@@ -14,7 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 def _get_separator_id(tokenizer: AutoTokenizer, sep_token: str) -> int:
-    """Return the numeric id for a separator token."""
+    """Return the numeric id for a separator token.
+    
+    Args:
+        tokenizer: Tokenizer for the model.
+        sep_token: The separator token string.
+    Returns:
+        The numeric ID of the separator token.
+    """
     sep_id = tokenizer.convert_tokens_to_ids(sep_token)
     if sep_id is None or sep_id == tokenizer.unk_token_id:
         ids = tokenizer.encode(sep_token, add_special_tokens=False)
@@ -42,7 +49,13 @@ class TrieNode:
         node.is_end = True
 
     def walk(self, token_ids: list[int]) -> Optional["TrieNode"]:
-        """Traverse the trie based on the given token IDs."""
+        """Traverse the trie based on the given token IDs.
+
+        Args:
+            token_ids: List of token IDs to traverse.
+        Returns:
+            The TrieNode at the end of the traversal, or None if the path does not exist.
+        """
         node = self
         for t in token_ids:
             node = node.children.get(t)
@@ -52,7 +65,14 @@ class TrieNode:
 
 
 def build_label_trie(tokenizer: AutoTokenizer, vocab: list[str]) -> TrieNode:
-    """Builds a TrieNode from a list of label strings."""
+    """Builds a TrieNode from a list of label strings.
+    
+    Args:
+        tokenizer: Tokenizer for the model.
+        vocab: List of label strings to insert into the trie.
+    Returns:
+        A TrieNode containing the label vocabulary.
+    """
     trie = TrieNode()
     for label in vocab:
         label = label.strip()
