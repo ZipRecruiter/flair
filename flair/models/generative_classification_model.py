@@ -42,6 +42,15 @@ class TrieNode:
             node = node.children.setdefault(tok, TrieNode())
         node.is_end = True
 
+    def walk(self, token_ids: List[int]) -> Optional["TrieNode"]:
+        """Traverse the trie based on the given token IDs."""
+        node = self
+        for t in token_ids:
+            node = node.children.get(t)
+            if node is None:
+                return None
+        return node
+
 
 def build_label_trie(tokenizer: AutoTokenizer, vocab: List[str], sep: str) -> TrieNode:
     """Builds a TrieNode from a list of label strings."""
@@ -85,8 +94,8 @@ def make_prefix_allowed_tokens_fn(
         last_sep = last_sep_indices[-1] if last_sep_indices else -1
         seg = ids[last_sep + 1 :]
 
-        # find all valid continuations in the trie
-        node = walk(trie, seg)
+        # find all valid continuations for this segment
+        node = trie.walk(seg)
         if node is None:
             return [eos_id]
         allowed = list(node.children.keys())
