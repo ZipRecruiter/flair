@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Union, Optional, List
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -31,17 +31,17 @@ def _get_separator_id(tokenizer: AutoTokenizer, sep_token: str) -> int:
 class TrieNode:
     """Trie for fast prefix-based filtering of label token sequences."""
 
-    children: Dict[int, "TrieNode"] = field(default_factory=dict)
+    children: dict[int, "TrieNode"] = field(default_factory=dict)
     is_end: bool = False
 
-    def insert(self, token_ids: List[int]) -> None:
+    def insert(self, token_ids: list[int]) -> None:
         """Insert a sequence of token IDs into this trie."""
         node = self
         for tok in token_ids:
             node = node.children.setdefault(tok, TrieNode())
         node.is_end = True
 
-    def walk(self, token_ids: List[int]) -> Optional["TrieNode"]:
+    def walk(self, token_ids: list[int]) -> Optional["TrieNode"]:
         """Traverse the trie based on the given token IDs."""
         node = self
         for t in token_ids:
@@ -51,7 +51,7 @@ class TrieNode:
         return node
 
 
-def build_label_trie(tokenizer: AutoTokenizer, vocab: List[str], sep: str) -> TrieNode:
+def build_label_trie(tokenizer: AutoTokenizer, vocab: list[str], sep: str) -> TrieNode:
     """Builds a TrieNode from a list of label strings."""
     trie = TrieNode()
     for label in vocab:
@@ -66,10 +66,10 @@ def build_label_trie(tokenizer: AutoTokenizer, vocab: List[str], sep: str) -> Tr
 
 
 def make_prefix_allowed_tokens_fn(
-    trie: TrieNode, tokenizer: AutoTokenizer, prompt_lengths: List[int], sep_id: int
-) -> Callable[[int, torch.LongTensor], List[int]]:
+    trie: TrieNode, tokenizer: AutoTokenizer, prompt_lengths: list[int], sep_id: int
+) -> Callable[[int, torch.LongTensor], list[int]]:
     """Factory that returns a prefix_allowed_tokens_fn for generate().
-    
+
     Args:
         trie: TrieNode containing the label vocabulary.
         tokenizer: Tokenizer for the model.
@@ -82,7 +82,7 @@ def make_prefix_allowed_tokens_fn(
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id
 
-    def prefix_fn(batch_id: int, full_ids: torch.LongTensor) -> List[int]:
+    def prefix_fn(batch_id: int, full_ids: torch.LongTensor) -> list[int]:
         """This function is used by the tranformer library as a prefix_allowed_tokens_fn.
         It is called during generation to filter the allowed tokens based on the current prefix.
         This ensures that only valid continuations of labels are generated.
@@ -143,9 +143,9 @@ class GenerativeClassifier(Classifier):
         mask_input: bool = True,
         separator: str = ",",
         use_constrained_decoding: bool = True,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-        label_rank_map: Optional[Dict[str, int]] = None,
-        label_sort_fn: Optional[Callable[[List[str]], List[str]]] = None,
+        generation_kwargs: Optional[dict[str, Any]] = None,
+        label_rank_map: Optional[dict[str, int]] = None,
+        label_sort_fn: Optional[Callable[[list[str]], list[str]]] = None,
         trust_remote_code: bool = False,
         max_length: int = 1024,
     ) -> None:
@@ -213,7 +213,7 @@ class GenerativeClassifier(Classifier):
         self.generation_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
 
         self._label_rank_map = label_rank_map or {}
-        self._sort_fn: Callable[[List[str]], List[str]] = (
+        self._sort_fn: Callable[[list[str]], list[str]] = (
             label_sort_fn or (lambda labels: sorted(labels, key=lambda l: self._label_rank_map.get(l, float("inf"))))
             if self._label_rank_map
             else sorted
@@ -238,7 +238,7 @@ class GenerativeClassifier(Classifier):
     def _ensure_special_tokens(
         self,
         tokenizer: AutoTokenizer,
-        additional_special_tokens: Optional[Dict[str, str]] = None,
+        additional_special_tokens: Optional[dict[str, str]] = None,
     ) -> AutoTokenizer:
         """Ensure tokenizer & model config have EOS, PAD, and BOS tokens defined."""
         default_map = {
@@ -268,7 +268,7 @@ class GenerativeClassifier(Classifier):
 
         return tokenizer
 
-    def forward_loss(self, sentences: List[Sentence]) -> Tuple[torch.Tensor, int]:
+    def forward_loss(self, sentences: list[Sentence]) -> tuple[torch.Tensor, int]:
         if not sentences:
             return torch.zeros(1, device=flair.device, requires_grad=True), 0
 
@@ -330,13 +330,13 @@ class GenerativeClassifier(Classifier):
 
     def predict(
         self,
-        sentences: Union[Sentence, List[Sentence]],
+        sentences: Union[Sentence, list[Sentence]],
         mini_batch_size: int = 8,
         label_name: Optional[str] = None,
         return_loss: bool = False,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
+        generation_kwargs: Optional[dict[str, Any]] = None,
         **kwargs,
-    ) -> Optional[Tuple[torch.Tensor, int]]:
+    ) -> Optional[tuple[torch.Tensor, int]]:
         if isinstance(sentences, Sentence):
             sentences = [sentences]
         if not sentences:
@@ -416,7 +416,7 @@ class GenerativeClassifier(Classifier):
         else:
             return None
 
-    def _get_state_dict(self) -> Dict[str, Any]:
+    def _get_state_dict(self) -> dict[str, Any]:
         savable_prompt_template = None
         if isinstance(self.prompt_template, str):
             savable_prompt_template = self.prompt_template
@@ -437,7 +437,7 @@ class GenerativeClassifier(Classifier):
         }
 
     @classmethod
-    def _init_model_with_state_dict(cls, state: Dict[str, Any], **kwargs) -> "GenerativeClassifier":
+    def _init_model_with_state_dict(cls, state: dict[str, Any], **kwargs) -> "GenerativeClassifier":
         prompt_template = state.get("prompt_template")
         if not prompt_template:
             logger.warning(
