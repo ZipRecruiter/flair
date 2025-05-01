@@ -285,18 +285,19 @@ class GenerativeClassifier(Classifier):
             if not gold_str:
                 continue
 
-            g_ids = self.tokenizer.encode(gold_str, add_special_tokens=False)
+            gold_string_ids = self.tokenizer.encode(gold_str, add_special_tokens=False)
 
-            max_prompt_len = max(0, self.max_length - len(g_ids) - 1)  # reserve room for gold + EOS
-            t_ids = self.tokenizer.encode(
+            max_prompt_len = max(0, self.max_length - len(gold_string_ids) - 1)  # reserve room for gold + EOS
+            prompt_ids = self.tokenizer.encode(
                 prompt,
                 add_special_tokens=False,
                 truncation=True,
                 max_length=max_prompt_len if max_prompt_len else 1,
             )
 
-            seq = t_ids + g_ids + [eos_id]
-            label = ([-100] * len(t_ids) + g_ids + [eos_id]) if self.mask_input else seq
+            seq = prompt_ids + gold_string_ids + [eos_id]
+            # mask input tokens with -100 for loss calculation if self.mask_input is True
+            label = ([-100] * len(prompt_ids) + gold_string_ids + [eos_id]) if self.mask_input else seq
 
             if len(seq) > self.max_length:
                 logger.error(
