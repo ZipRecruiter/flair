@@ -8,7 +8,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import flair
 from flair.data import Dictionary, Sentence
-from flair.embeddings import TransformerEmbeddings
 from flair.nn import Classifier
 
 logger = logging.getLogger(__name__)
@@ -58,6 +57,7 @@ def build_label_trie(tokenizer: AutoTokenizer, vocab: List[str], sep: str) -> Tr
     for label in vocab:
         label = label.strip()
         if not label:
+            logger.warning("Empty label found in vocabulary. Skipping.")
             continue
         token_ids = tokenizer.encode(f" {label}", add_special_tokens=False)
         if token_ids:
@@ -66,30 +66,43 @@ def build_label_trie(tokenizer: AutoTokenizer, vocab: List[str], sep: str) -> Tr
 
 
 def make_prefix_allowed_tokens_fn(
-    trie: TrieNode, tokenizer: AutoTokenizer, prompt_lens: List[int], sep_id: int
+    trie: TrieNode, tokenizer: AutoTokenizer, prompt_lengths: List[int], sep_id: int
 ) -> Callable[[int, torch.LongTensor], List[int]]:
-    """Factory that returns a prefix_allowed_tokens_fn for generate()."""
+    """Factory that returns a prefix_allowed_tokens_fn for generate().
+    
+    Args:
+        trie: TrieNode containing the label vocabulary.
+        tokenizer: Tokenizer for the model.
+        prompt_lengths: List of prompt lengths for each batch item. This is used to determine the start of the label segment.
+        sep_id: ID of the separator token.
+
+    Returns:
+        A `prefix_allowed_tokens_fn` function that filters allowed tokens based on the current prefix.
+    """
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id
 
-    def walk(node: TrieNode, tokens: List[int]) -> Optional[TrieNode]:
-        for t in tokens:
-            node = node.children.get(t)
-            if node is None:
-                return None
-        return node
-
     def prefix_fn(batch_id: int, full_ids: torch.LongTensor) -> List[int]:
-        # remove prompt and padding tokens
+        """This function is used by the tranformer library as a prefix_allowed_tokens_fn.
+        It is called during generation to filter the allowed tokens based on the current prefix.
+        This ensures that only valid continuations of labels are generated.
+
+        Example Output Format:
+        <prompt_tokens> label_1 <sep> label_2 <sep> ... <sep> label_n <eos>
+        """
+        # remove padding tokens
         ids = full_ids.view(-1).tolist()
         while ids and ids[0] == pad_id:
             ids.pop(0)
-        ids = ids[prompt_lens[batch_id] :]
 
+        # remove prompt tokens
+        ids = ids[prompt_lengths[batch_id] :]
+
+        # no label tokens have been generated yet; all starting tokens are valid
         if not ids:
             return list(trie.children.keys())
 
-        # find the start of the last segment (tokens after the last separator)
+        # find the start of the last label segment (tokens after the last separator)
         last_sep_indices = [i for i, x in enumerate(ids) if x == sep_id]
         last_sep = last_sep_indices[-1] if last_sep_indices else -1
         seg = ids[last_sep + 1 :]
@@ -97,9 +110,11 @@ def make_prefix_allowed_tokens_fn(
         # find all valid continuations for this segment
         node = trie.walk(seg)
         if node is None:
+            # no valid continuations; return only EOS
             return [eos_id]
         allowed = list(node.children.keys())
         if node.is_end:
+            # if this segment is a valid label, allow EOS and the separator token
             allowed += [eos_id, sep_id]
 
         return allowed if allowed else [eos_id]
@@ -360,8 +375,8 @@ class GenerativeClassifier(Classifier):
                         raise RuntimeError("Constrained decoding enabled, but Trie was not built.")
 
                     # get the prompt lengths for the prefix function.
-                    prompt_lens = tok["attention_mask"].sum(dim=1).tolist()
-                    prefix_fn = make_prefix_allowed_tokens_fn(self._trie, self.tokenizer, prompt_lens, self._sep_id)
+                    prompt_lengths = tok["attention_mask"].sum(dim=1).tolist()
+                    prefix_fn = make_prefix_allowed_tokens_fn(self._trie, self.tokenizer, prompt_lengths, self._sep_id)
 
                 gen_ids = self.causal_model.generate(
                     **tok,
