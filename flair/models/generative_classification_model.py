@@ -51,7 +51,7 @@ class TrieNode:
         return node
 
 
-def build_label_trie(tokenizer: AutoTokenizer, vocab: list[str], sep: str) -> TrieNode:
+def build_label_trie(tokenizer: AutoTokenizer, vocab: list[str]) -> TrieNode:
     """Builds a TrieNode from a list of label strings."""
     trie = TrieNode()
     for label in vocab:
@@ -102,13 +102,13 @@ def make_prefix_allowed_tokens_fn(
         if not ids:
             return list(trie.children.keys())
 
-        # find the start of the last label segment (tokens after the last separator)
-        last_sep_indices = [i for i, x in enumerate(ids) if x == sep_id]
-        last_sep = last_sep_indices[-1] if last_sep_indices else -1
-        seg = ids[last_sep + 1 :]
+        # find the start of the current label segment (tokens since the last separator)
+        separator_indices = [i for i, x in enumerate(ids) if x == sep_id]
+        last_sep = separator_indices[-1] if separator_indices else -1
+        label_segment = ids[last_sep + 1 :]
 
-        # find all valid continuations for this segment
-        node = trie.walk(seg)
+        # find all valid continuations for this label segment
+        node = trie.walk(label_segment)
         if node is None:
             # no valid continuations; return only EOS
             return [eos_id]
@@ -199,7 +199,7 @@ class GenerativeClassifier(Classifier):
         self._trie: Optional[TrieNode] = None
         if self.use_constrained_decoding:
             logger.info("Building label Trie for constrained decoding...")
-            self._trie = build_label_trie(tokenizer, label_dictionary.get_items(), separator)
+            self._trie = build_label_trie(tokenizer, label_dictionary.get_items())
             logger.info("Label Trie built.")
         else:
             logger.info("`use_constrained_decoding` is False. Prediction will use unconstrained generation.")
