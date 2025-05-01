@@ -387,15 +387,11 @@ class GenerativeClassifier(Classifier):
                 gen_only = gen_ids[:, tok["input_ids"].shape[1] :]  # remove prompt tokens
                 outputs = self.tokenizer.batch_decode(gen_only, skip_special_tokens=True)
 
-                valid_label_set = set(self.label_dictionary.get_items()) if self.use_constrained_decoding else None
                 for sentence, out_str in zip(batch, outputs):
                     sentence.remove_labels(label_type)
                     generated_items = {s.strip() for s in out_str.split(self.separator) if s.strip()}
                     for item in generated_items:
-                        if self.use_constrained_decoding:
-                            if item in valid_label_set:
-                                sentence.add_label(label_type, item)
-                        else:
+                        if not self.use_constrained_decoding or self.label_dictionary.has_item(item):
                             sentence.add_label(label_type, item)
 
                 if return_loss:
