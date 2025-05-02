@@ -662,9 +662,9 @@ class ModelTrainer(Pluggable):
                     #     batch_sampler=sampler
                     # )
                     # ----------------------------------------
-                    max_tokens_per_batch_step = 4096
-                    max_sentences_per_batch_step = 64
-                    min_sentences_per_batch_step = 8
+                    max_tokens_per_batch_step = 2048
+                    max_sentences_per_batch_step = 4
+                    min_sentences_per_batch_step = 2
                     skip_ratio = 0.8
                     sampler = SingleLengthSingleTaskAdaptiveBatchSampler(
                         max_tokens_per_batch_step=max_tokens_per_batch_step,
@@ -866,7 +866,8 @@ class ModelTrainer(Pluggable):
 
                         if evaluation_split == "dev":
                             for task_id in task_ids:
-                                prev_dev_micro_f1[task_id] = eval_result.classification_report[task_id]['micro avg']['f1-score']
+                                if task_id in eval_result.classification_report and 'micro avg' in eval_result.classification_report[task_id] and 'f1-score' in eval_result.classification_report[task_id]['micro avg']:
+                                    prev_dev_micro_f1[task_id] = eval_result.classification_report[task_id]['micro avg']['f1-score']
 
                             if is_main_process():
                                 s3_resource = boto3.resource("s3")
