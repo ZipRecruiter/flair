@@ -533,7 +533,7 @@ def load_model_components(
     model_name: str,
     fine_tune: bool = False,
     trust_remote_code: bool = False,
-    use_flair_embedding: bool = True,
+    use_embedding: bool = True,
     is_document_embedding: bool = True,
     is_token_embedding: bool = False,
     cls_pooling: str = "mean",
@@ -550,14 +550,14 @@ def load_model_components(
         model_name: The name of the pre-trained model to load.
         fine_tune: If True, the weights of the transformers embedding will be updated during training.
         trust_remote_code: If True, allows loading models from external sources (Huggingface).
-        use_flair_embedding: If True, loads a Flair TransformerEmbeddings wrapper.
+        use_embedding: If True, loads a Flair TransformerEmbeddings wrapper.
         is_document_embedding: If True, this embeddings can be handled document-embeddings.
         is_token_embedding: If True, this embeddings can be handled as token-embeddings.
         cls_pooling: Specify how the document-embeddings will be extracted.
         device_map: Device placement for the model. Defaults to None (auto-detect).
 
     Returns:
-        A tuple containing the Flair TransformerEmbeddings (if `use_flair_embedding` is True) and the causal model.
+        A tuple containing the Flair TransformerEmbeddings (if `use_embedding` is True) and the causal model.
     """
     if device_map is None and torch.cuda.is_available():
         device_map = "auto"
@@ -574,11 +574,11 @@ def load_model_components(
         logger.error(f"Failed to load causal model '{model_name}': {e}")
         raise
 
-    flair_embedding = None
-    if use_flair_embedding:
+    embeddings = None
+    if use_embedding:
         logger.info(f"Loading Flair TransformerEmbeddings for '{model_name}'")
         try:
-            flair_embedding = TransformerEmbeddings(
+            embeddings = TransformerEmbeddings(
                 model_name,
                 fine_tune=fine_tune,
                 trust_remote_code=trust_remote_code,
@@ -597,8 +597,8 @@ def load_model_components(
         for attr in ("base_model", "model", "transformer"):
             if hasattr(causal_model, attr):
                 try:
-                    flair_embedding.model = getattr(causal_model, attr)
-                    logger.info(f"Tied flair_embedding.model to causal_model.{attr}")
+                    embeddings.model = getattr(causal_model, attr)
+                    logger.info(f"Tied embedding.model to causal_model.{attr}")
                     tied = True
                 except Exception as tie_err:
                     logger.warning(f"Weight tying via '{attr}' failed: {tie_err}")
@@ -608,16 +608,11 @@ def load_model_components(
                 "Could not find any of 'base_model', 'model', or 'transformer' in causal_model; skipping weight tying."
             )
 
-        # disable use_cache for safe multitask training
-        if hasattr(flair_embedding.model.config, "use_cache"):
-            flair_embedding.model.config.use_cache = False
-            logger.info("Disabled use_cache on flair_embedding.model.config")
+        if hasattr(embeddings.model.config, "output_hidden_states"):
+            embeddings.model.config.output_hidden_states = True
+            logger.info("Enabled output_hidden_states on embedding.model.config")
 
-        if hasattr(flair_embedding.model.config, "output_hidden_states"):
-            flair_embedding.model.config.output_hidden_states = True
-            logger.info("Enabled output_hidden_states on flair_embedding.model.config")
-
-        flair_embedding.model_name = model_name
+        embeddings.model_name = model_name
 
     logger.info("Model components ready.")
-    return flair_embedding, causal_model
+    return embeddings, causal_model
