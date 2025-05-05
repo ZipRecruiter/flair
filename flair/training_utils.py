@@ -6,20 +6,20 @@ from enum import Enum
 from functools import reduce
 from math import inf
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Union, Tuple
+from typing import Literal, NamedTuple, Optional, Union
 
+import torch.nn as nn
 from numpy import ndarray
-import torch
-from transformers import AutoModelForCausalLM
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from torch.optim import Optimizer
 from torch.utils.data import Dataset
+from transformers import AutoModelForCausalLM
 
-from flair.data import DT, Dictionary, Sentence, Token, _iter_dataset
-from flair.embeddings import TransformerEmbeddings
+import flair
 from flair.class_utils import StringLike
 from flair.data import DT, Dictionary, Sentence, Token, _iter_dataset
+from flair.embeddings import TransformerEmbeddings
 
 EmbeddingStorageMode = Literal["none", "cpu", "gpu"]
 MinMax = Literal["min", "max"]
@@ -529,90 +529,136 @@ def create_labeled_sentence_from_entity_offsets(
     return create_labeled_sentence_from_tokens(tokens, token_entities)
 
 
-def load_model_components(
-    model_name: str,
-    fine_tune: bool = False,
-    trust_remote_code: bool = False,
-    use_embedding: bool = True,
-    is_document_embedding: bool = True,
-    is_token_embedding: bool = False,
-    cls_pooling: str = "mean",
-    device_map: Optional[str] = None,
-    transformer_embeddings_kwargs: Optional[dict] = None,
-) -> Tuple[
-    Optional[TransformerEmbeddings],
-    AutoModelForCausalLM,
-]:
-    """Load a pre-trained causal language model, optionally wrapping it in a Flair TransformerEmbeddings.
-    This function also handles device placement and weight tying between the causal model and the embeddings to support multitask training.
+def _tie_weights_recursively(
+    target_module: nn.Module,
+    source_module: nn.Module,
+    prefix: str = "",
+) -> tuple[list[str], list[str]]:
+    """Recursively attempts to tie 'weight' and 'bias' parameters from source_module
+    to target_module if names and shapes match.
 
     Args:
-        model_name: The name of the pre-trained model to load.
-        fine_tune: If True, the weights of the transformers embedding will be updated during training.
-        trust_remote_code: If True, allows loading models from external sources (Huggingface).
-        use_embedding: If True, loads a Flair TransformerEmbeddings wrapper.
-        is_document_embedding: If True, this embeddings can be handled document-embeddings.
-        is_token_embedding: If True, this embeddings can be handled as token-embeddings.
-        cls_pooling: Specify how the document-embeddings will be extracted.
-        device_map: Device placement for the model. Defaults to None (auto-detect).
+        target_module: The module to which parameters will be tied.
+        source_module: The module from which parameters will be sourced.
+        prefix: The prefix for parameter names (used for tracking).
 
     Returns:
-        A tuple containing the Flair TransformerEmbeddings (if `use_embedding` is True) and the causal model.
+        A tuple containing two lists:
+        - tied_params: List of names of successfully tied parameters.
+        - mismatched_params: List of names/reasons for parameters that couldn't be tied.
     """
-    if device_map is None and torch.cuda.is_available():
-        device_map = "auto"
+    tied_params: list[str] = []
+    mismatched_params: list[str] = []
+    processed_leaf_params = False
 
-    logger.info(f"Loading causal model from '{model_name}' (trust_remote_code={trust_remote_code})")
-    try:
-        causal_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            device_map=device_map,
+    # handle leaf parameters (weight and bias)
+    for param_type in ("weight", "bias"):
+        target_param = getattr(target_module, param_type, None)
+
+        if isinstance(target_param, nn.Parameter):
+            processed_leaf_params = True
+            param_name = f"{prefix}.{param_type}" if prefix else param_type
+            source_param = getattr(source_module, param_type, None)
+
+            if isinstance(source_param, nn.Parameter):
+                if target_param.shape == source_param.shape:
+                    # replace target parameter with source parameter
+                    setattr(target_module, param_type, source_param)
+                    tied_params.append(param_name)
+                else:
+                    mismatched_params.append(
+                        f"{param_name} (shape mismatch: target {target_param.shape} vs source {source_param.shape})"
+                    )
+            elif source_param is None and param_type == "bias":
+                # bias is not present in source module
+                pass
+            else:
+                status = "missing" if source_param is None else "not a parameter"
+                mismatched_params.append(f"{param_name} ({status} in source)")
+
+    if processed_leaf_params:
+        return tied_params, mismatched_params
+
+    # recurse into children modules
+    target_children = dict(target_module.named_children())
+    source_children = dict(source_module.named_children())
+
+    for name, target_child in target_children.items():
+        current_prefix = f"{prefix}.{name}" if prefix else name
+        if name in source_children:
+            source_child = source_children[name]
+            if type(target_child) == type(source_child):
+                child_tied, child_mismatched = _tie_weights_recursively(
+                    target_child,
+                    source_child,
+                    prefix=current_prefix,
+                )
+                tied_params.extend(child_tied)
+                mismatched_params.extend(child_mismatched)
+            else:
+                mismatched_params.append(
+                    f"{current_prefix} (type mismatch: target {type(target_child).__name__} vs source {type(source_child).__name__})"
+                )
+        else:
+            mismatched_params.append(f"{current_prefix} (module missing in source)")
+
+    return tied_params, mismatched_params
+
+
+def load_and_tie_causal_model(
+    embeddings: TransformerEmbeddings,
+    model_name: str,
+    trust_remote_code: bool = False,
+) -> AutoModelForCausalLM:
+    """Loads a causal LM and recursively ties its weights to an existing TransformerEmbeddings model's base module.
+
+    Args:
+        embeddings: An existing TransformerEmbeddings instance.
+        model_name: Name of the pre-trained causal model to load. Must be compatible with the embeddings model.
+        trust_remote_code: Whether to trust remote code.
+
+    Returns:
+        The loaded AutoModelForCausalLM instance with weights tied.
+    """
+    causal_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    ).to(flair.device)
+
+    # TransformerEmbeddings may add additional special tokens. We need to resize the target model's embeddings to match.
+    causal_model.resize_token_embeddings(embeddings.model.get_input_embeddings().weight.shape[0])
+
+    # find the base module attribute for weight tying
+    possible_attrs = ("transformer", "model", "base_model")
+    base_module_attr = None
+    for attr in possible_attrs:
+        if hasattr(embeddings.model, attr):
+            base_module_attr = attr
+            break
+    if base_module_attr is None:
+        raise RuntimeError(
+            f"Could not find compatible base module attribute for weight tying between "
+            f"{type(embeddings.model).__name__} and {type(causal_model).__name__}."
         )
-        logger.info("Causal model loaded successfully.")
-    except Exception as e:
-        logger.error(f"Failed to load causal model '{model_name}': {e}")
-        raise
+    source_base_module = getattr(embeddings.model, base_module_attr, None)
+    target_base_module = getattr(causal_model, base_module_attr, None)
 
-    embeddings = None
-    if use_embedding:
-        logger.info(f"Loading Flair TransformerEmbeddings for '{model_name}'")
-        try:
-            embeddings = TransformerEmbeddings(
-                model_name,
-                fine_tune=fine_tune,
-                trust_remote_code=trust_remote_code,
-                is_document_embedding=is_document_embedding,
-                is_token_embedding=is_token_embedding,
-                cls_pooling=cls_pooling,
-                **(transformer_embeddings_kwargs if transformer_embeddings_kwargs else {}),
-            )
-            logger.info("Flair TransformerEmbeddings loaded.")
-        except Exception as e:
-            logger.error(f"Failed to load TransformerEmbeddings for '{model_name}': {e}")
-            raise
+    tied_params, mismatched_params = _tie_weights_recursively(
+        target_module=target_base_module,
+        source_module=source_base_module,
+        prefix=base_module_attr,
+    )
 
-        # tie the shared weights
-        tied = False
-        for attr in ("base_model", "model", "transformer"):
-            if hasattr(causal_model, attr):
-                try:
-                    embeddings.model = getattr(causal_model, attr)
-                    logger.info(f"Tied embedding.model to causal_model.{attr}")
-                    tied = True
-                except Exception as tie_err:
-                    logger.warning(f"Weight tying via '{attr}' failed: {tie_err}")
-                break
-        if not tied:
-            logger.warning(
-                "Could not find any of 'base_model', 'model', or 'transformer' in causal_model; skipping weight tying."
-            )
+    num_tied = len(tied_params)
+    num_mismatched = len(mismatched_params)
+    if num_mismatched > 0:
+        # Log a warning if any mismatches occurred
+        logger.warning(
+            f"Weight tying completed with {num_mismatched} mismatched/untied parameters within '{base_module_attr}'."
+        )
+    if not num_tied:
+        # If NO parameters were tied, it's a critical failure.
+        raise RuntimeError(f"Could not tie weights for module '{base_module_attr}'.")
 
-        if hasattr(embeddings.model.config, "output_hidden_states"):
-            embeddings.model.config.output_hidden_states = True
-            logger.info("Enabled output_hidden_states on embedding.model.config")
-
-        embeddings.model_name = model_name
-
-    logger.info("Model components ready.")
-    return embeddings, causal_model
+    logger.info(f"Successfully tied {num_tied} parameters for module '{base_module_attr}'.")
+    return causal_model
