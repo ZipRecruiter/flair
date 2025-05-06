@@ -534,8 +534,7 @@ def _tie_weights_recursively(
     source_module: nn.Module,
     prefix: str = "",
 ) -> tuple[list[str], list[str]]:
-    """Recursively attempts to tie 'weight' and 'bias' parameters from source_module
-    to target_module if names and shapes match.
+    """Recursively attempts to tie 'weight' and 'bias' parameters from source_module to target_module if names and shapes match.
 
     Args:
         target_module: The module to which parameters will be tied.
@@ -587,7 +586,7 @@ def _tie_weights_recursively(
         current_prefix = f"{prefix}.{name}" if prefix else name
         if name in source_children:
             source_child = source_children[name]
-            if type(target_child) == type(source_child):
+            if type(target_child) is type(source_child):
                 child_tied, child_mismatched = _tie_weights_recursively(
                     target_child,
                     source_child,
