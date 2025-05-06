@@ -10,6 +10,8 @@ import flair
 from flair.data import Dictionary, Sentence
 from flair.nn import Classifier
 
+from transformers import AutoConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -439,6 +441,7 @@ class GenerativeClassifier(Classifier):
             savable_prompt_template = self.prompt_template
 
         return {
+            **super()._get_state_dict(),
             "label_dictionary": self.label_dictionary,
             "label_type": self.label_type,
             "lm_model_name": self.causal_model.config._name_or_path,
@@ -477,9 +480,14 @@ class GenerativeClassifier(Classifier):
 
         lm_name = state["lm_model_name"]
         tokenizer = AutoTokenizer.from_pretrained(lm_name, trust_remote_code=trust_remote_code)
-        causal_model = AutoModelForCausalLM.from_pretrained(lm_name, trust_remote_code=trust_remote_code)
+        
+        # Load model and update vocab size
+        config = AutoConfig.from_pretrained(lm_name, trust_remote_code=trust_remote_code)
+        saved_vocab_size = state["lm_state_dict"]["model.embed_tokens.weight"].size(0)
+        config.vocab_size = saved_vocab_size
+        causal_model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
         causal_model.load_state_dict(state["lm_state_dict"])
-
+        
         model = cls(
             causal_model=causal_model,
             tokenizer=tokenizer,
@@ -492,6 +500,7 @@ class GenerativeClassifier(Classifier):
             generation_kwargs=generation_kwargs,
             label_rank_map=label_rank_map,
             max_length=max_length,
+            trust_remote_code=trust_remote_code,
             **kwargs,
         )
 
