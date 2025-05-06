@@ -1,26 +1,25 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Union, Optional, List
+from typing import Any, Callable, Optional, Union
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import flair
 from flair.data import Dictionary, Sentence
 from flair.nn import Classifier
-
-from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
 
 
 def _get_separator_id(tokenizer: AutoTokenizer, sep_token: str) -> int:
     """Return the numeric id for a separator token.
-    
+
     Args:
         tokenizer: Tokenizer for the model.
         sep_token: The separator token string.
+
     Returns:
         The numeric ID of the separator token.
     """
@@ -55,6 +54,7 @@ class TrieNode:
 
         Args:
             token_ids: List of token IDs to traverse.
+
         Returns:
             The TrieNode at the end of the traversal, or None if the path does not exist.
         """
@@ -68,10 +68,11 @@ class TrieNode:
 
 def build_label_trie(tokenizer: AutoTokenizer, vocab: list[str]) -> TrieNode:
     """Builds a TrieNode from a list of label strings.
-    
+
     Args:
         tokenizer: Tokenizer for the model.
         vocab: List of label strings to insert into the trie.
+
     Returns:
         A TrieNode containing the label vocabulary.
     """
@@ -106,6 +107,7 @@ def make_prefix_allowed_tokens_fn(
 
     def prefix_fn(batch_id: int, full_ids: torch.LongTensor) -> list[int]:
         """This function is used by the tranformer library as a prefix_allowed_tokens_fn.
+
         It is called during generation to filter the allowed tokens based on the current prefix.
         This ensures that only valid continuations of labels are generated.
 
@@ -185,6 +187,7 @@ class GenerativeClassifier(Classifier):
             generation_kwargs: Arguments passed to HuggingFace `generate()` during prediction. `max_new_tokens` defaults to 64. Defaults to {}.
             label_rank_map: Map from label string to rank for consistent sorting (lower rank first). Used if `label_sort_fn` is None. Defaults to None.
             label_sort_fn: Function to sort gold labels for target string creation. If None, uses `label_rank_map` or alphabetical order. Defaults to None.
+            trust_remote_code: If True, allows loading models with remote code. Defaults to False.
             max_length: Maximum sequence length (prompt + generated tokens) for truncation. Defaults to 1024.
         """
         super().__init__()
@@ -236,7 +239,7 @@ class GenerativeClassifier(Classifier):
 
         self._label_rank_map = label_rank_map or {}
         self._sort_fn: Callable[[list[str]], list[str]] = (
-            label_sort_fn or (lambda labels: sorted(labels, key=lambda l: self._label_rank_map.get(l, float("inf"))))
+            label_sort_fn or (lambda labels: sorted(labels, key=lambda label: self._label_rank_map.get(label, float("inf"))))
             if self._label_rank_map
             else sorted
         )
@@ -480,14 +483,14 @@ class GenerativeClassifier(Classifier):
 
         lm_name = state["lm_model_name"]
         tokenizer = AutoTokenizer.from_pretrained(lm_name, trust_remote_code=trust_remote_code)
-        
+
         # Load model and update vocab size
         config = AutoConfig.from_pretrained(lm_name, trust_remote_code=trust_remote_code)
         saved_vocab_size = state["lm_state_dict"]["model.embed_tokens.weight"].size(0)
         config.vocab_size = saved_vocab_size
         causal_model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
         causal_model.load_state_dict(state["lm_state_dict"])
-        
+
         model = cls(
             causal_model=causal_model,
             tokenizer=tokenizer,
