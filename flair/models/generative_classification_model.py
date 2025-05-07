@@ -235,10 +235,13 @@ class GenerativeClassifier(Classifier):
         self.generation_kwargs.setdefault("max_new_tokens", 128)
         self.generation_kwargs.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         self.generation_kwargs.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+        self.generation_kwargs.setdefault("num_beams", 3)
+        self.generation_kwargs.setdefault("early_stopping", True)
 
         self._label_rank_map = label_rank_map or {}
         self._sort_fn: Callable[[list[str]], list[str]] = (
-            label_sort_fn or (lambda labels: sorted(labels, key=lambda label: self._label_rank_map.get(label, float("inf"))))
+            label_sort_fn
+            or (lambda labels: sorted(labels, key=lambda label: self._label_rank_map.get(label, float("inf"))))
             if self._label_rank_map
             else sorted
         )
