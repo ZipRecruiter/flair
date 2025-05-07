@@ -214,7 +214,6 @@ class GenerativeClassifier(Classifier):
         self.label_dictionary = label_dictionary
         self.tokenizer = tokenizer
         self.tokenizer.padding_side = "left"  # decoder-only models require left padding for batched generation
-        self._ensure_special_tokens(self.tokenizer)
 
         self._label_type = label_type
         self.separator = separator
@@ -259,39 +258,6 @@ class GenerativeClassifier(Classifier):
         labels = [label.value for label in s.get_labels(self.label_type)]
         sorted_labels = self._sort_fn(labels)
         return f"{self.separator} ".join(sorted_labels)
-
-    def _ensure_special_tokens(
-        self,
-        tokenizer: AutoTokenizer,
-        additional_special_tokens: Optional[dict[str, str]] = None,
-    ) -> AutoTokenizer:
-        """Ensure tokenizer & model config have EOS, PAD, and BOS tokens defined."""
-        default_map = {
-            "eos_token": "[EOS]",
-            "pad_token": "[PAD]",
-            "bos_token": "[BOS]",
-        }
-        if additional_special_tokens:
-            default_map.update(additional_special_tokens)
-
-        to_add = {attr: sym for attr, sym in default_map.items() if getattr(tokenizer, attr, None) is None}
-
-        if not to_add:
-            return tokenizer
-
-        logger.info(f"Adding special tokens: {to_add}")
-        tokenizer.add_special_tokens(to_add)
-        self.causal_model.resize_token_embeddings(len(tokenizer))
-
-        # update model.config.*_token_id fields for any we just added
-        for token_attr in to_add:
-            cfg_attr = token_attr + "_id"
-            tok_id = getattr(tokenizer, token_attr + "_id", None)
-            if tok_id is not None and getattr(self.causal_model.config, cfg_attr, None) is None:
-                setattr(self.causal_model.config, cfg_attr, tok_id)
-                logger.info(f"Set model.config.{cfg_attr} = {tok_id}")
-
-        return tokenizer
 
     def forward_loss(self, sentences: list[Sentence]) -> tuple[torch.Tensor, int]:
         if not sentences:
