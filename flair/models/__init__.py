@@ -1,5 +1,6 @@
 from .entity_linker_model import SpanClassifier
 from .entity_mention_linking import EntityMentionLinker
+from .generative_classification_model import GenerativeClassifier
 from .language_model import LanguageModel
 from .lemmatizer_model import Lemmatizer
 from .multitask_model import MultitaskModel
@@ -19,6 +20,7 @@ from .word_tagger_model import TokenClassifier, WordTagger
 __all__ = [
     "EntityMentionLinker",
     "FewshotClassifier",
+    "GenerativeClassifier",
     "LanguageModel",
     "Lemmatizer",
     "MultitaskModel",
