@@ -8,15 +8,18 @@ from math import inf
 from pathlib import Path
 from typing import Literal, NamedTuple, Optional, Union
 
+import torch.nn as nn
 from numpy import ndarray
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from torch.optim import Optimizer
 from torch.utils.data import Dataset
+from transformers import AutoModelForCausalLM
 
 import flair
 from flair.class_utils import StringLike
 from flair.data import DT, Dictionary, Sentence, Token, _iter_dataset
+from flair.embeddings import TransformerEmbeddings
 
 EmbeddingStorageMode = Literal["none", "cpu", "gpu"]
 MinMax = Literal["min", "max"]
@@ -524,3 +527,137 @@ def create_labeled_sentence_from_entity_offsets(
         token_entities = [entity for entity in token_entities if entity.end_token_idx <= token_limit]
 
     return create_labeled_sentence_from_tokens(tokens, token_entities)
+
+
+def _tie_weights_recursively(
+    target_module: nn.Module,
+    source_module: nn.Module,
+    prefix: str = "",
+) -> tuple[list[str], list[str]]:
+    """Recursively attempts to tie 'weight' and 'bias' parameters from source_module to target_module if names and shapes match.
+
+    Args:
+        target_module: The module to which parameters will be tied.
+        source_module: The module from which parameters will be sourced.
+        prefix: The prefix for parameter names (used for tracking).
+
+    Returns:
+        A tuple containing two lists:
+        - tied_params: List of names of successfully tied parameters.
+        - mismatched_params: List of names/reasons for parameters that couldn't be tied.
+    """
+    tied_params: list[str] = []
+    mismatched_params: list[str] = []
+    processed_leaf_params = False
+
+    # handle leaf parameters (weight and bias)
+    for param_type in ("weight", "bias"):
+        target_param = getattr(target_module, param_type, None)
+
+        if isinstance(target_param, nn.Parameter):
+            processed_leaf_params = True
+            param_name = f"{prefix}.{param_type}" if prefix else param_type
+            source_param = getattr(source_module, param_type, None)
+
+            if isinstance(source_param, nn.Parameter):
+                if target_param.shape == source_param.shape:
+                    # replace target parameter with source parameter
+                    setattr(target_module, param_type, source_param)
+                    tied_params.append(param_name)
+                else:
+                    mismatched_params.append(
+                        f"{param_name} (shape mismatch: target {target_param.shape} vs source {source_param.shape})"
+                    )
+            elif source_param is None and param_type == "bias":
+                # bias is not present in source module
+                pass
+            else:
+                status = "missing" if source_param is None else "not a parameter"
+                mismatched_params.append(f"{param_name} ({status} in source)")
+
+    if processed_leaf_params:
+        return tied_params, mismatched_params
+
+    # recurse into children modules
+    target_children = dict(target_module.named_children())
+    source_children = dict(source_module.named_children())
+
+    for name, target_child in target_children.items():
+        current_prefix = f"{prefix}.{name}" if prefix else name
+        if name in source_children:
+            source_child = source_children[name]
+            if type(target_child) is type(source_child):
+                child_tied, child_mismatched = _tie_weights_recursively(
+                    target_child,
+                    source_child,
+                    prefix=current_prefix,
+                )
+                tied_params.extend(child_tied)
+                mismatched_params.extend(child_mismatched)
+            else:
+                mismatched_params.append(
+                    f"{current_prefix} (type mismatch: target {type(target_child).__name__} vs source {type(source_child).__name__})"
+                )
+        else:
+            mismatched_params.append(f"{current_prefix} (module missing in source)")
+
+    return tied_params, mismatched_params
+
+
+def load_and_tie_causal_model(
+    embeddings: TransformerEmbeddings,
+    model_name: str,
+    trust_remote_code: bool = False,
+) -> AutoModelForCausalLM:
+    """Loads a causal LM and recursively ties its weights to an existing TransformerEmbeddings model's base module.
+
+    Args:
+        embeddings: An existing TransformerEmbeddings instance.
+        model_name: Name of the pre-trained causal model to load. Must be compatible with the embeddings model.
+        trust_remote_code: Whether to trust remote code.
+
+    Returns:
+        The loaded AutoModelForCausalLM instance with weights tied.
+    """
+    causal_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+    ).to(flair.device)
+
+    # TransformerEmbeddings may add additional special tokens. We need to resize the target model's embeddings to match.
+    causal_model.resize_token_embeddings(embeddings.model.get_input_embeddings().weight.shape[0])
+
+    # find the base module attribute for weight tying
+    possible_attrs = ("transformer", "model", "base_model")
+    base_module_attr = None
+    for attr in possible_attrs:
+        if hasattr(embeddings.model, attr):
+            base_module_attr = attr
+            break
+    if base_module_attr is None:
+        raise RuntimeError(
+            f"Could not find compatible base module attribute for weight tying between "
+            f"{type(embeddings.model).__name__} and {type(causal_model).__name__}."
+        )
+    source_base_module = getattr(embeddings.model, base_module_attr, None)
+    target_base_module = getattr(causal_model, base_module_attr, None)
+
+    tied_params, mismatched_params = _tie_weights_recursively(
+        target_module=target_base_module,
+        source_module=source_base_module,
+        prefix=base_module_attr,
+    )
+
+    num_tied = len(tied_params)
+    num_mismatched = len(mismatched_params)
+    if num_mismatched > 0:
+        # Log a warning if any mismatches occurred
+        logger.warning(
+            f"Weight tying completed with {num_mismatched} mismatched/untied parameters within '{base_module_attr}'."
+        )
+    if not num_tied:
+        # If NO parameters were tied, it's a critical failure.
+        raise RuntimeError(f"Could not tie weights for module '{base_module_attr}'.")
+
+    logger.info(f"Successfully tied {num_tied} parameters for module '{base_module_attr}'.")
+    return causal_model
