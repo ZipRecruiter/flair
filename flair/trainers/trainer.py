@@ -8,6 +8,9 @@ import warnings
 from inspect import signature
 from pathlib import Path
 from typing import Optional, Union
+import math
+import boto3
+import pickle
 
 import numpy as np
 import torch
@@ -37,6 +40,7 @@ from flair.trainers.plugins import (
     WeightExtractorPlugin,
 )
 from flair.training_utils import EmbeddingStorageMode, identify_dynamic_embeddings, log_line, store_embeddings
+from flair.trainers.dynamic_batch_size_samplers import SingleLengthSingleTaskBatchSampler, SingleLengthSingleTaskAdaptiveBatchSampler, SingleTaskBatchSampler, SingleTaskAdaptiveBatchSampler
 
 log = logging.getLogger("flair")
 
@@ -267,6 +271,8 @@ class ModelTrainer(Pluggable):
         # plugins
         plugins: Optional[list[TrainerPlugin]] = None,
         attach_default_scheduler: bool = True,
+        sampler_cache_s3_bucket: str = "",
+        sampler_cache_s3_folder: str = "",
         **kwargs,
     ):
         exclude_labels = exclude_labels if exclude_labels is not None else []
@@ -317,6 +323,8 @@ class ModelTrainer(Pluggable):
             multi_gpu=multi_gpu,
             # plugins
             plugins=plugins,
+            sampler_cache_s3_bucket=sampler_cache_s3_bucket,
+            sampler_cache_s3_folder=sampler_cache_s3_folder,
             **kwargs,
         )
 
@@ -362,6 +370,8 @@ class ModelTrainer(Pluggable):
         multi_gpu: bool = False,
         # plugins
         plugins: Optional[list[TrainerPlugin]] = None,
+        sampler_cache_s3_bucket: str = "",
+        sampler_cache_s3_folder: str = "",
         **kwargs,
     ) -> dict:
         """Trains any class that implements the :class:`flair.nn.Model` interface.
@@ -601,6 +611,17 @@ class ModelTrainer(Pluggable):
                 total_train_samples = 0
                 batch_count = 0
 
+                task_ids = train_data.ids
+                prev_dev_micro_f1 = {task_id: 0 for task_id in task_ids}
+                
+                try:
+                    s3_client = boto3.client("s3")
+                    prev_dev_micro_f1_file_name = f"{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl"
+                    prev_dev_micro_f1 = pickle.loads(s3_client.get_object(Bucket=sampler_cache_s3_bucket, Key=prev_dev_micro_f1_file_name)['Body'].read())
+                    log.warning(f"Load prev_dev_micro_f1 from s3://{sampler_cache_s3_bucket}/{prev_dev_micro_f1_file_name}")
+                except:
+                    pass
+                
                 for epoch in range(epoch + 1, max_epochs + 1):
                     log_line(log)
 
@@ -616,24 +637,72 @@ class ModelTrainer(Pluggable):
                     if not shuffle_first_epoch and epoch == 1:
                         shuffle_data_this_epoch = False
 
-                    if multi_gpu:
-                        distributed_sampler: DistributedSampler = DistributedSampler(
-                            train_data, shuffle=shuffle_data_this_epoch
-                        )
-                        distributed_sampler.set_epoch(epoch - 1)
-                        batch_loader = DataLoader(
-                            train_data,
-                            batch_size=mini_batch_size,
-                            shuffle=False,
-                            sampler=distributed_sampler,
-                        )
-                    else:
-                        batch_loader = DataLoader(
-                            train_data,
-                            batch_size=mini_batch_size,
-                            shuffle=shuffle_data_this_epoch,
-                            sampler=sampler,
-                        )
+                    # ----------------------------------------
+                    # Basic
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_size=mini_batch_size,
+                    #     shuffle=shuffle_data_this_epoch,
+                    #     sampler=sampler,
+                    # )
+                    # ----------------------------------------
+                    # max_tokens_per_batch_step = 4096
+                    # max_sentences_per_batch_step = 64
+                    # min_sentences_per_batch_step = 8
+                    # sampler = SingleLengthSingleTaskBatchSampler(
+                    #     max_tokens_per_batch_step=max_tokens_per_batch_step,
+                    #     max_sentences_per_batch_step=max_sentences_per_batch_step,
+                    #     min_sentences_per_batch_step=min_sentences_per_batch_step,
+                    #     skip_ratio=None
+                    # )
+                    # sampler.set_dataset(train_data, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
+                    max_tokens_per_batch_step = 2048
+                    max_sentences_per_batch_step = 4
+                    min_sentences_per_batch_step = 2
+                    skip_ratio = 0.8
+                    sampler = SingleLengthSingleTaskAdaptiveBatchSampler(
+                        max_tokens_per_batch_step=max_tokens_per_batch_step,
+                        max_sentences_per_batch_step=max_sentences_per_batch_step,
+                        min_sentences_per_batch_step=min_sentences_per_batch_step,
+                        skip_ratio=skip_ratio
+                    )
+                    sampler.set_dataset(train_data, prev_dev_micro_f1, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    sampler.set_epoch(epoch)
+                    batch_loader = DataLoader(
+                        train_data,
+                        batch_sampler=sampler
+                    )
+                    # ----------------------------------------
+                    # sampler = SingleTaskBatchSampler(
+                    #     mini_batch_chunk_size=2,
+                    #     shuffle=True,
+                    #     seed=0
+                    # )
+                    # sampler.set_dataset(train_data, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
+                    # sampler = SingleTaskAdaptiveBatchSampler(
+                    #     mini_batch_chunk_size=2,
+                    #     shuffle=True,
+                    #     seed=0
+                    # )
+                    # sampler.set_dataset(train_data, prev_dev_micro_f1, sampler_cache_s3_bucket, sampler_cache_s3_folder)
+                    # sampler.set_epoch(epoch)
+                    # batch_loader = DataLoader(
+                    #     train_data,
+                    #     batch_sampler=sampler
+                    # )
+                    # ----------------------------------------
 
                     self.model.train()
 
@@ -642,11 +711,18 @@ class ModelTrainer(Pluggable):
 
                     epoch_start_time = time.time()
 
+                    NUM_STEPS_PER_BATCH = 16
+                    total_number_of_batches = math.ceil(len(batch_loader) / NUM_STEPS_PER_BATCH) 
                     # log infos on training progress every `log_modulo` batches
-                    log_modulo = max(1, int(len(batch_loader) / 10))
+                    log_modulo = max(1, int(total_number_of_batches / 10))
 
+                    batch_steps = []
                     # process mini-batches
                     for batch_no, batch in enumerate(batch_loader):
+                        batch_steps.append(batch)
+                        if (batch_no + 1) % NUM_STEPS_PER_BATCH != 0 and batch_no != len(batch_loader) - 1:
+                            continue
+
                         # zero the gradients on the model and optimizer
                         self.model.zero_grad()
                         self.optimizer.zero_grad()
@@ -656,16 +732,16 @@ class ModelTrainer(Pluggable):
                         batch_count += 1
 
                         batch_kw = {
-                            "batch_no": batch_no,
-                            "batch": batch,
-                            "total_number_of_batches": len(batch_loader),
+                            "batch_no": batch_no // NUM_STEPS_PER_BATCH,
+                            # "batch": [item for batch_step in batch_steps for item in batch_step],
+                            "total_number_of_batches": total_number_of_batches,
                             "epoch": epoch,
                             "batch_count": batch_count,
                         }
 
                         self.dispatch("before_training_batch", **batch_kw)
 
-                        batch_steps = self.get_batch_steps(batch, mini_batch_chunk_size=mini_batch_chunk_size)
+                        # batch_steps = self.get_batch_steps(batch, mini_batch_chunk_size=mini_batch_chunk_size)
 
                         # forward and backward for batch
                         for batch_step_no, batch_step in enumerate(batch_steps):
@@ -728,11 +804,11 @@ class ModelTrainer(Pluggable):
                             epoch_train_loss += batch_train_loss
                             epoch_train_samples += batch_train_samples
 
-                        if (batch_no + 1) % log_modulo == 0:
+                        if (batch_no // NUM_STEPS_PER_BATCH + 1) % log_modulo == 0:
                             intermittent_loss = (
                                 epoch_train_loss / epoch_train_samples
                                 if epoch_train_samples > 0
-                                else epoch_train_samples / (batch_no + 1)
+                                else None
                             )
                             intermittent_loss = aggregate(intermittent_loss, np.mean)
 
@@ -743,12 +819,13 @@ class ModelTrainer(Pluggable):
                             lr_info, momentum_info = self._get_current_lr_and_momentum(batch_count)
                             log.info(
                                 f"epoch {epoch}"
-                                f" - iter {batch_no + 1}/{len(batch_loader)}"
+                                f" - iter {batch_no // NUM_STEPS_PER_BATCH + 1}/{total_number_of_batches}"
                                 f" - loss {intermittent_loss:.8f}"
                                 f" - time (sec): {(current_time - epoch_start_time):.2f}"
                                 f" - samples/sec: {samples_per_second:.2f}"
                                 f"{lr_info}{momentum_info}"
                             )
+                        batch_steps = []
 
                         # - SchedulerPlugin -> do the scheduler step if one-cycle or linear decay
                         # - WeightExtractorPlugin -> extracts weights
@@ -786,6 +863,17 @@ class ModelTrainer(Pluggable):
                             gold_label_dictionary_for_eval=gold_label_dictionary_for_eval,
                             multi_gpu=multi_gpu,
                         )
+
+                        if evaluation_split == "dev":
+                            for task_id in task_ids:
+                                if task_id in eval_result.classification_report and 'micro avg' in eval_result.classification_report[task_id] and 'f1-score' in eval_result.classification_report[task_id]['micro avg']:
+                                    prev_dev_micro_f1[task_id] = eval_result.classification_report[task_id]['micro avg']['f1-score']
+
+                            if is_main_process():
+                                s3_resource = boto3.resource("s3")
+                                pickle_bytes = pickle.dumps(prev_dev_micro_f1)
+                                s3_resource.Object(sampler_cache_s3_bucket, f"{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl").put(Body=pickle_bytes)
+                                log.warning(f"Dump prev_dev_micro_f1 to s3://{sampler_cache_s3_bucket}/{sampler_cache_s3_folder}/prev_dev_micro_f1.pkl")
 
                         # log results
                         log.info(
