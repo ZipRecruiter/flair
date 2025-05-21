@@ -8,6 +8,7 @@ import boto3
 import random
 from typing import Optional
 from transformers import AutoTokenizer
+from flair.data import DataPair
 
 logger = logging.getLogger("flair")
 
@@ -261,7 +262,12 @@ class SingleLengthSingleTaskAdaptiveBatchSampler(BatchSampler):
                 end_idx = self.cummulative_sizes[task_index]
                 length_buckets = defaultdict(list)
                 for idx in range(start_idx, end_idx):
-                    length = len(tokenizer([token.text for token in self.dataset[idx]], is_split_into_words=True)['input_ids'])
+                    if isinstance(self.dataset[idx], DataPair):
+                        length_first = len(tokenizer([token.text for token in self.dataset[idx].first], is_split_into_words=True)['input_ids'])
+                        length_second = len(tokenizer([token.text for token in self.dataset[idx].second], is_split_into_words=True)['input_ids'])
+                        length = max(length_first, length_second)
+                    else:
+                        length = len(tokenizer([token.text for token in self.dataset[idx]], is_split_into_words=True)['input_ids'])
                     length_buckets[length].append(idx)
                 length_buckets_list.append(length_buckets)
 
@@ -489,7 +495,7 @@ class SingleTaskAdaptiveBatchSampler(BatchSampler):
         
         batches = []
         for indices_one_task in shuffled_indices:
-            for i in range(0, len(indices_one_task), self.mini_batch_chunk_size):
+            for i in range(0, len(indices_one_task) // self.mini_batch_chunk_size * self.mini_batch_chunk_size, self.mini_batch_chunk_size):
                 batches.append(indices_one_task[i: i+self.mini_batch_chunk_size])
 
         # deterministically shuffle based on epoch and seed
