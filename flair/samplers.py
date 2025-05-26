@@ -1,9 +1,14 @@
 import logging
+import pickle
 import random
 from collections import defaultdict
+from typing import Callable, Optional
 
+import boto3
 import torch
 from torch.utils.data.sampler import Sampler
+
+from flair.data import ConcatFlairDataset
 
 log = logging.getLogger("flair")
 
@@ -114,3 +119,103 @@ class ExpandingChunkSampler(FlairSampler):
             self.block_size += 1
 
         return iter(data)
+
+
+class SingleTaskAdaptiveBatchSampler:
+    # TODO: docstring
+    def __init__(
+        self,
+        dataset: ConcatFlairDataset,
+        batch_size: int = 2,
+        downsample_ratio_func: Optional[Callable[[float], float]] = None,
+        seed: int = 0,
+        debug_mode: bool = False,
+        s3_bucket: Optional[str] = None,
+        s3_folder: Optional[str] = None,
+    ):
+        if not isinstance(dataset, ConcatFlairDataset):
+            raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
+        assert len(dataset.cummulative_sizes) == len(dataset.ids)
+        self.cummulative_sizes = dataset.cummulative_sizes
+        self.task_ids = dataset.ids
+        log.warning(f"cummulative_sizes: {dataset.cummulative_sizes!s}")
+        log.warning(f"task_ids: {dataset.ids!s}")
+
+        self.batch_size = batch_size
+        self.downsample_ratio_func = downsample_ratio_func
+        self.seed = seed
+        self.debug_mode = debug_mode
+        self.s3_bucket = s3_bucket
+        self.s3_folder = s3_folder
+
+        if torch.distributed.is_initialized():
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.num_replicas = 1
+            self.rank = 0
+
+    def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int):
+        # TODO: docstring
+        self.batches = []
+
+        for task_index, task_id in enumerate(self.task_ids):
+            start_idx = 0 if task_index == 0 else self.cummulative_sizes[task_index - 1]
+            end_idx = self.cummulative_sizes[task_index]  # exclusive
+            num_datapoints_this_task = end_idx - start_idx
+            indices_this_task = list(range(start_idx, end_idx))
+
+            if self.downsample_ratio_func:
+                downsample_ratio = self.downsample_ratio_func(prev_dev_micro_f1[task_id])
+                downsample_size = int(num_datapoints_this_task * downsample_ratio)
+                log.warning(
+                    f"For {task_id}, downsample_ratio is {downsample_ratio:.4f} and downsample_size is {downsample_size}"
+                )
+                if downsample_size < num_datapoints_this_task:
+                    # indices_this_task must be identical across all GPUs
+                    random.seed(self.seed + epoch)
+                    num_datapoints_this_task = downsample_size
+                    indices_this_task = random.sample(indices_this_task, downsample_size)
+
+            if shuffle:
+                g = torch.Generator()
+                # indices_this_task must be identical across all GPUs
+                g.manual_seed(self.seed + epoch)
+                perm = torch.randperm(num_datapoints_this_task, generator=g).tolist()
+                indices_this_task = [indices_this_task[i] for i in perm]
+
+            # Distribute indices_this_task to each GPU
+            num_datapoints_this_task_per_GPU = (
+                num_datapoints_this_task // self.num_replicas
+            )  # drop the remaining training data if it is not divisible by self.num_replicas
+            num_datapoints_this_task_per_GPU = (
+                num_datapoints_this_task_per_GPU // self.batch_size * self.batch_size
+            )  # drop the remaining training data if it is not divisible by self.batch_size
+            indices_this_task_this_GPU = indices_this_task[
+                self.rank : num_datapoints_this_task_per_GPU * self.num_replicas : self.num_replicas
+            ]
+            self.batches += [
+                indices_this_task_this_GPU[i : i + self.batch_size]
+                for i in range(0, num_datapoints_this_task_per_GPU, self.batch_size)
+            ]
+
+        if shuffle:
+            g = torch.Generator()
+            # perm must be identical across all GPUs
+            g.manual_seed(self.seed + epoch)
+            perm = torch.randperm(len(self.batches), generator=g).tolist()
+            self.batches = [self.batches[i] for i in perm]
+
+        if self.debug_mode:
+            boto3.resource("s3").Object(
+                self.s3_bucket, f"{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
+            ).put(Body=pickle.dumps(self.batches))
+            log.warning(
+                f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
+            )
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)

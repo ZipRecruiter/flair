@@ -2,6 +2,7 @@ import contextlib
 import inspect
 import logging
 import os
+import pickle
 import random
 import time
 import warnings
@@ -9,6 +10,7 @@ from inspect import signature
 from pathlib import Path
 from typing import Optional, Union
 
+import boto3
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -18,10 +20,10 @@ from torch.utils.data.dataset import ConcatDataset
 
 import flair
 import flair.nn
-from flair.data import Corpus, Dictionary, _len_dataset
+from flair.data import Corpus, Dictionary, MultiCorpus, _len_dataset
 from flair.datasets import DataLoader
 from flair.distributed_utils import aggregate, is_main_process, validate_corpus_same_each_process
-from flair.samplers import FlairSampler
+from flair.samplers import FlairSampler, SingleTaskAdaptiveBatchSampler
 from flair.trainers.plugins import (
     AnnealingPlugin,
     CheckpointPlugin,
@@ -916,6 +918,12 @@ class ModelTrainer(Pluggable):
     def fine_tune_with_customized_sampler(
         self,
         base_path: Union[Path, str],
+        sampler: SingleTaskAdaptiveBatchSampler,
+        # parameter to guide adaptive downsampling of training data
+        prev_dev_micro_f1: Optional[dict[str, float]] = None,
+        # location to store prev_dev_micro_f1
+        s3_bucket: Optional[str] = None,
+        s3_folder: Optional[str] = None,
         # training parameters
         warmup_fraction: float = 0.1,
         learning_rate: float = 5e-5,
@@ -937,7 +945,6 @@ class ModelTrainer(Pluggable):
         gold_label_dictionary_for_eval: Optional[Dictionary] = None,
         exclude_labels: Optional[list[str]] = None,
         # sampling and shuffling
-        sampler=None,
         shuffle: bool = True,
         shuffle_first_epoch: bool = True,
         # evaluation and monitoring
@@ -959,6 +966,9 @@ class ModelTrainer(Pluggable):
         attach_default_scheduler: bool = True,
         **kwargs,
     ):
+        if train_with_dev or train_with_test or main_evaluation_metric != ("micro avg", "f1-score"):
+            raise NotImplementedError
+
         exclude_labels = exclude_labels if exclude_labels is not None else []
         # annealing logic
         if plugins is None:
@@ -1009,8 +1019,9 @@ class ModelTrainer(Pluggable):
         # derive parameters the function was called with (or defaults)
         local_variables = locals()
         training_parameters = {
-            parameter: local_variables[parameter] for parameter in signature(self.train_custom).parameters
+            parameter: local_variables[parameter] for parameter in signature(self.fine_tune_with_customized_sampler).parameters
         }
+        training_parameters.pop("sampler")
         training_parameters.update(kwargs)
 
         # initialize model card with these parameters
@@ -1020,6 +1031,16 @@ class ModelTrainer(Pluggable):
         train_data = self._get_train_data(train_with_dev=train_with_dev, train_with_test=train_with_test)
         dataset_size = _len_dataset(train_data)
         parameters = {"dataset_size": dataset_size, **training_parameters}
+
+        # ensure the corpus is a MultiCorpus and has a development set, as required for fine-tuning with the customized sampler.
+        if not isinstance(self.corpus, MultiCorpus):
+            raise NotImplementedError
+        if not self.corpus.dev:
+            raise NotImplementedError
+
+        # parameter to guide adaptive downsampling of training data
+        if not prev_dev_micro_f1:
+            prev_dev_micro_f1 = {task_id: 0 for task_id in train_data.ids}
 
         # determine what splits (train, dev, test) to evaluate
         evaluation_splits = {}
@@ -1064,15 +1085,6 @@ class ModelTrainer(Pluggable):
                 optimizer_state_loaded = True
             except Exception as e:
                 log.warning(f"Found saved optimizer state from previous training but coult not load: {e}")
-
-        # initialize sampler if provided
-        if sampler is not None:
-            # init with default values if only class is provided
-            if isinstance(sampler, type):
-                sampler = sampler()
-            # set dataset to sample from
-            sampler.set_dataset(train_data)
-            shuffle = False
 
         # configure special behavior to use multiple GPUs
         if multi_gpu:
@@ -1172,24 +1184,10 @@ class ModelTrainer(Pluggable):
                     if not shuffle_first_epoch and epoch == 1:
                         shuffle_data_this_epoch = False
 
-                    if multi_gpu:
-                        distributed_sampler: DistributedSampler = DistributedSampler(
-                            train_data, shuffle=shuffle_data_this_epoch
-                        )
-                        distributed_sampler.set_epoch(epoch - 1)
-                        batch_loader = DataLoader(
-                            train_data,
-                            batch_size=mini_batch_size,
-                            shuffle=False,
-                            sampler=distributed_sampler,
-                        )
-                    else:
-                        batch_loader = DataLoader(
-                            train_data,
-                            batch_size=mini_batch_size,
-                            shuffle=shuffle_data_this_epoch,
-                            sampler=sampler,
-                        )
+                    sampler.generate_batches(
+                        prev_dev_micro_f1=prev_dev_micro_f1, shuffle=shuffle_data_this_epoch, epoch=epoch
+                    )
+                    batch_loader = DataLoader(train_data, batch_sampler=sampler)
 
                     self.model.train()
 
@@ -1355,6 +1353,24 @@ class ModelTrainer(Pluggable):
                         store_embeddings(evaluation_split_data, embeddings_storage_mode)
 
                         self._publish_eval_result(eval_result, evaluation_split, global_step=epoch)
+
+                        if evaluation_split == "dev":
+                            for task_id in train_data.ids:
+                                try:
+                                    prev_dev_micro_f1[task_id] = eval_result.classification_report[task_id][
+                                        "micro avg"
+                                    ]["f1-score"]
+                                except Exception as e:
+                                    log.warning(e)
+
+                            if s3_bucket and s3_folder and is_main_process():
+                                # upload file to s3 so we can recover it
+                                boto3.resource("s3").Object(s3_bucket, f"{s3_folder}/prev_dev_micro_f1.pkl").put(
+                                    Body=pickle.dumps(prev_dev_micro_f1)
+                                )
+                                log.warning(
+                                    f"Dump prev_dev_micro_f1 to s3://{s3_bucket}/{s3_folder}/prev_dev_micro_f1.pkl"
+                                )
 
                         # use DEV split to determine if this is the best model so far
                         if determine_best_epoch_using_dev_score and evaluation_split == "dev":
