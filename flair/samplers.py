@@ -2,6 +2,7 @@ import logging
 import pickle
 import random
 from collections import defaultdict
+from collections.abc import Iterator
 from typing import Callable, Optional
 
 import boto3
@@ -121,7 +122,84 @@ class ExpandingChunkSampler(FlairSampler):
         return iter(data)
 
 
-class SingleTaskAdaptiveBatchSampler:
+class AdaptiveBatchSamplerBaseClass:
+    # TODO: docstring
+    def __init__(
+        self,
+        seed: int = 0,
+        s3_bucket: Optional[str] = None,
+        s3_folder: Optional[str] = None,
+    ) -> None:
+        self.seed = seed
+        self.s3_bucket = s3_bucket
+        self.s3_folder = s3_folder
+
+        if torch.distributed.is_initialized():
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.num_replicas = 1
+            self.rank = 0
+
+    def generate_batches(self) -> None:
+        raise NotImplementedError
+
+    def downsample_distribute_and_chunk_indices(
+        self, indices: list[int], downsample_ratio: Optional[float], shuffle: bool, epoch: int, batch_size: int
+    ) -> list[list[int]]:
+        num_datapoints = len(indices)
+
+        # downsample indices
+        if downsample_ratio:
+            downsample_size = int(num_datapoints * downsample_ratio)
+            if downsample_size <= num_datapoints:
+                # control randomness to ensure indices are identical across all GPUs
+                random.seed(self.seed + epoch)
+                indices = random.sample(indices, downsample_size)
+                num_datapoints = downsample_size
+
+        if shuffle:
+            # control randomness to ensure indices are identical across all GPUs
+            g = torch.Generator()
+            g.manual_seed(self.seed + epoch)
+            perm = torch.randperm(num_datapoints, generator=g).tolist()
+            indices = [indices[i] for i in perm]
+
+        # Distribute indices to each GPU
+        num_datapoints_per_GPU = (
+            num_datapoints // self.num_replicas
+        )  # drop the remaining training data if it is not divisible by self.num_replicas
+        num_datapoints_per_GPU = (
+            num_datapoints_per_GPU // batch_size * batch_size
+        )  # drop the remaining training data if it is not divisible by batch_size
+        indices_this_GPU = indices[self.rank : num_datapoints_per_GPU * self.num_replicas : self.num_replicas]
+
+        # chunk indices to batches
+        return [indices_this_GPU[i : i + batch_size] for i in range(0, num_datapoints_per_GPU, batch_size)]
+
+    def shuffle_batches(self, batches: list[list[int]], epoch: int) -> list[list[int]]:
+        # control randomness to ensure the permutation to shuffle batches are identical across all GPUs
+        g = torch.Generator()
+        g.manual_seed(self.seed + epoch)
+        perm = torch.randperm(len(batches), generator=g).tolist()
+        return [batches[i] for i in perm]
+
+    def save_batches_to_s3(self, epoch: int) -> None:
+        boto3.resource("s3").Object(self.s3_bucket, f"{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl").put(
+            Body=pickle.dumps(self.batches)
+        )
+        log.warning(
+            f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
+        )
+
+    def __iter__(self) -> Iterator[list[int]]:
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
     # TODO: docstring
     def __init__(
         self,
@@ -132,14 +210,12 @@ class SingleTaskAdaptiveBatchSampler:
         debug_mode: bool = False,
         s3_bucket: Optional[str] = None,
         s3_folder: Optional[str] = None,
-    ):
+    ) -> None:
         if not isinstance(dataset, ConcatFlairDataset):
             raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
         assert len(dataset.cummulative_sizes) == len(dataset.ids)
         self.cummulative_sizes = dataset.cummulative_sizes
         self.task_ids = dataset.ids
-        log.warning(f"cummulative_sizes: {dataset.cummulative_sizes!s}")
-        log.warning(f"task_ids: {dataset.ids!s}")
 
         self.batch_size = batch_size
         self.downsample_ratio_func = downsample_ratio_func
@@ -155,67 +231,117 @@ class SingleTaskAdaptiveBatchSampler:
             self.num_replicas = 1
             self.rank = 0
 
-    def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int):
+        if self.debug_mode:
+            log.info(f"cummulative_sizes: {dataset.cummulative_sizes!s}")
+            log.info(f"task_ids: {dataset.ids!s}")
+
+    def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int) -> None:
         # TODO: docstring
         self.batches = []
 
         for task_index, task_id in enumerate(self.task_ids):
             start_idx = 0 if task_index == 0 else self.cummulative_sizes[task_index - 1]
             end_idx = self.cummulative_sizes[task_index]  # exclusive
-            num_datapoints_this_task = end_idx - start_idx
             indices_this_task = list(range(start_idx, end_idx))
-
+            downsample_ratio = None
             if self.downsample_ratio_func:
                 downsample_ratio = self.downsample_ratio_func(prev_dev_micro_f1[task_id])
-                downsample_size = int(num_datapoints_this_task * downsample_ratio)
-                log.warning(
-                    f"For {task_id}, downsample_ratio is {downsample_ratio:.4f} and downsample_size is {downsample_size}"
-                )
-                if downsample_size < num_datapoints_this_task:
-                    # indices_this_task must be identical across all GPUs
-                    random.seed(self.seed + epoch)
-                    num_datapoints_this_task = downsample_size
-                    indices_this_task = random.sample(indices_this_task, downsample_size)
+                log.warning(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
 
-            if shuffle:
-                g = torch.Generator()
-                # indices_this_task must be identical across all GPUs
-                g.manual_seed(self.seed + epoch)
-                perm = torch.randperm(num_datapoints_this_task, generator=g).tolist()
-                indices_this_task = [indices_this_task[i] for i in perm]
-
-            # Distribute indices_this_task to each GPU
-            num_datapoints_this_task_per_GPU = (
-                num_datapoints_this_task // self.num_replicas
-            )  # drop the remaining training data if it is not divisible by self.num_replicas
-            num_datapoints_this_task_per_GPU = (
-                num_datapoints_this_task_per_GPU // self.batch_size * self.batch_size
-            )  # drop the remaining training data if it is not divisible by self.batch_size
-            indices_this_task_this_GPU = indices_this_task[
-                self.rank : num_datapoints_this_task_per_GPU * self.num_replicas : self.num_replicas
-            ]
-            self.batches += [
-                indices_this_task_this_GPU[i : i + self.batch_size]
-                for i in range(0, num_datapoints_this_task_per_GPU, self.batch_size)
-            ]
-
-        if shuffle:
-            g = torch.Generator()
-            # perm must be identical across all GPUs
-            g.manual_seed(self.seed + epoch)
-            perm = torch.randperm(len(self.batches), generator=g).tolist()
-            self.batches = [self.batches[i] for i in perm]
-
-        if self.debug_mode:
-            boto3.resource("s3").Object(
-                self.s3_bucket, f"{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
-            ).put(Body=pickle.dumps(self.batches))
-            log.warning(
-                f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
+            self.batches += self.downsample_distribute_and_chunk_indices(
+                indices=indices_this_task,
+                downsample_ratio=downsample_ratio,
+                shuffle=shuffle,
+                epoch=epoch,
+                batch_size=self.batch_size,
             )
 
-    def __iter__(self):
-        return iter(self.batches)
+        if shuffle:
+            self.batches = self.shuffle_batches(self.batches, epoch)
 
-    def __len__(self):
-        return len(self.batches)
+        if self.debug_mode:
+            self.save_batches_to_s3(epoch)
+
+
+class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
+    # TODO: docstring
+    def __init__(
+        self,
+        dataset: ConcatFlairDataset,
+        length_dicts_for_tasks: dict[str, dict[int, list[int]]],
+        batch_size_func: Callable[[int], int],
+        downsample_ratio_func: Optional[Callable[[float], float]] = None,
+        seed: int = 0,
+        debug_mode: bool = False,
+        s3_bucket: Optional[str] = None,
+        s3_folder: Optional[str] = None,
+    ) -> None:
+        if not isinstance(dataset, ConcatFlairDataset):
+            raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
+        assert len(dataset.cummulative_sizes) == len(dataset.ids)
+        self.cummulative_sizes = dataset.cummulative_sizes
+        self.task_ids = dataset.ids
+
+        # shift indices in length_dict of each task by the task's offset in dataset
+        task_start_idx = {}
+        task_end_idx = {}
+        for task_idx, task_id in enumerate(self.task_ids):
+            task_start_idx[task_id] = 0 if task_idx == 0 else self.cummulative_sizes[task_idx - 1]
+            task_end_idx[task_id] = self.cummulative_sizes[task_idx]  # exclusive
+        self.length_dicts_for_tasks = {}
+        for task_id in self.task_ids:
+            self.length_dicts_for_tasks[task_id] = {}
+            for length, indices in length_dicts_for_tasks[task_id].items():
+                self.length_dicts_for_tasks[task_id][length] = (
+                    SingleTaskSingleLengthAdaptiveBatchSampler.apply_offset_to_list(indices, task_start_idx[task_id])
+                )
+                assert max(self.length_dicts_for_tasks[task_id][length]) < task_end_idx[task_id]
+
+        self.batch_size_func = batch_size_func
+        self.downsample_ratio_func = downsample_ratio_func
+        self.seed = seed
+        self.debug_mode = debug_mode
+        self.s3_bucket = s3_bucket
+        self.s3_folder = s3_folder
+
+        if torch.distributed.is_initialized():
+            self.num_replicas = torch.distributed.get_world_size()
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.num_replicas = 1
+            self.rank = 0
+
+        if self.debug_mode:
+            log.info(f"cummulative_sizes: {dataset.cummulative_sizes!s}")
+            log.info(f"task_ids: {dataset.ids!s}")
+
+    @staticmethod
+    def apply_offset_to_list(list_of_int: list[int], offset: int) -> list[int]:
+        return [x + offset for x in list_of_int]
+
+    def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int) -> None:
+        # TODO: docstring
+        self.batches = []
+
+        for task_id in self.task_ids:
+            downsample_ratio = None
+            if self.downsample_ratio_func:
+                downsample_ratio = self.downsample_ratio_func(prev_dev_micro_f1[task_id])
+                log.warning(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
+
+            length_dict_this_task = self.length_dicts_for_tasks[task_id]
+            for length, indices_this_task_this_length in length_dict_this_task.items():
+                batch_size = self.batch_size_func(length)
+                self.batches += self.downsample_distribute_and_chunk_indices(
+                    indices=indices_this_task_this_length,
+                    downsample_ratio=downsample_ratio,
+                    shuffle=shuffle,
+                    epoch=epoch,
+                    batch_size=batch_size,
+                )
+
+        if shuffle:
+            self.batches = self.shuffle_batches(self.batches, epoch)
+
+        if self.debug_mode:
+            self.save_batches_to_s3(epoch)

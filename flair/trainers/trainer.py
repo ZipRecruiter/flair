@@ -1,6 +1,7 @@
 import contextlib
 import inspect
 import logging
+import math
 import os
 import pickle
 import random
@@ -23,7 +24,7 @@ import flair.nn
 from flair.data import Corpus, Dictionary, MultiCorpus, _len_dataset
 from flair.datasets import DataLoader
 from flair.distributed_utils import aggregate, is_main_process, validate_corpus_same_each_process
-from flair.samplers import FlairSampler, SingleTaskAdaptiveBatchSampler
+from flair.samplers import FlairSampler, SingleTaskAdaptiveBatchSampler, SingleTaskSingleLengthAdaptiveBatchSampler
 from flair.trainers.plugins import (
     AnnealingPlugin,
     CheckpointPlugin,
@@ -918,7 +919,7 @@ class ModelTrainer(Pluggable):
     def fine_tune_with_customized_sampler(
         self,
         base_path: Union[Path, str],
-        sampler: SingleTaskAdaptiveBatchSampler,
+        sampler: Union[SingleTaskAdaptiveBatchSampler, SingleTaskSingleLengthAdaptiveBatchSampler],
         # parameter to guide adaptive downsampling of training data
         prev_dev_micro_f1: Optional[dict[str, float]] = None,
         # location to store prev_dev_micro_f1
@@ -928,9 +929,9 @@ class ModelTrainer(Pluggable):
         warmup_fraction: float = 0.1,
         learning_rate: float = 5e-5,
         decoder_learning_rate: Optional[float] = None,
-        mini_batch_size: int = 4,
+        num_batches_per_optimizer_step: int = 16,
+        mini_batch_size: int = 4,  # mini_batch_size is used by LinearSchedulerPlugin
         eval_batch_size: int = 16,
-        mini_batch_chunk_size: Optional[int] = None,
         max_epochs: int = 10,
         optimizer: type[torch.optim.Optimizer] = torch.optim.AdamW,
         train_with_dev: bool = False,
@@ -967,6 +968,9 @@ class ModelTrainer(Pluggable):
         **kwargs,
     ):
         if train_with_dev or train_with_test or main_evaluation_metric != ("micro avg", "f1-score"):
+            raise NotImplementedError
+
+        if write_weights:
             raise NotImplementedError
 
         exclude_labels = exclude_labels if exclude_labels is not None else []
@@ -1019,7 +1023,8 @@ class ModelTrainer(Pluggable):
         # derive parameters the function was called with (or defaults)
         local_variables = locals()
         training_parameters = {
-            parameter: local_variables[parameter] for parameter in signature(self.fine_tune_with_customized_sampler).parameters
+            parameter: local_variables[parameter]
+            for parameter in signature(self.fine_tune_with_customized_sampler).parameters
         }
         training_parameters.pop("sampler")
         training_parameters.update(kwargs)
@@ -1143,7 +1148,7 @@ class ModelTrainer(Pluggable):
                 f' - learning_rate: "{learning_rate}" '
                 f'{"(decoder: " + str(decoder_learning_rate) + ")" if decoder_learning_rate else ""}'
             )
-            log.info(f' - mini_batch_size: "{mini_batch_size}"')
+            log.info(f' - num_batches_per_optimizer_step: "{num_batches_per_optimizer_step}"')
             log.info(f' - max_epochs: "{max_epochs}"')
             log.info(f' - shuffle: "{shuffle}"')
             if optimizer_state_loaded:
@@ -1167,7 +1172,7 @@ class ModelTrainer(Pluggable):
             # At any point you can hit Ctrl + C to break out of training early.
             try:
                 total_train_samples = 0
-                batch_count = 0
+                optimizer_step_count = 0
 
                 for epoch in range(epoch + 1, max_epochs + 1):
                     log_line(log)
@@ -1177,7 +1182,7 @@ class ModelTrainer(Pluggable):
                     self.dispatch("before_training_epoch", epoch=epoch)
                     self.model.model_card["training_parameters"]["epoch"] = epoch  # type: ignore[index]
 
-                    lr_info, momentum_info = self._get_current_lr_and_momentum(batch_count)
+                    lr_info, momentum_info = self._get_current_lr_and_momentum(optimizer_step_count)
 
                     # if shuffle_first_epoch==False, the first epoch is not shuffled
                     shuffle_data_this_epoch = shuffle
@@ -1196,34 +1201,41 @@ class ModelTrainer(Pluggable):
 
                     epoch_start_time = time.time()
 
+                    # Learnable parameters are updated every num_batches_per_optimizer_step batches.
+                    # When using SingleTaskSingleLengthAdaptiveBatchSampler, the size of each batch may vary.
+                    num_optimizer_steps = math.ceil(len(batch_loader) / num_batches_per_optimizer_step)
+
                     # log infos on training progress every `log_modulo` batches
-                    log_modulo = max(1, int(len(batch_loader) / 10))
+                    log_modulo = max(1, int(num_optimizer_steps / 10))
+
+                    batches_current_optimizer_step = []
 
                     # process mini-batches
                     for batch_no, batch in enumerate(batch_loader):
+                        batches_current_optimizer_step.append(batch)
+                        if (batch_no + 1) % num_batches_per_optimizer_step != 0 and batch_no != len(batch_loader) - 1:
+                            continue
+
                         # zero the gradients on the model and optimizer
                         self.model.zero_grad()
                         self.optimizer.zero_grad()
 
-                        batch_train_loss = 0.0
-                        batch_train_samples = 0
-                        batch_count += 1
+                        optimizer_train_loss = 0.0
+                        optimizer_train_samples = 0
+                        optimizer_step_count += 1
 
                         batch_kw = {
-                            "batch_no": batch_no,
-                            "batch": batch,
-                            "total_number_of_batches": len(batch_loader),
+                            "optimizer_step_no": batch_no // num_batches_per_optimizer_step,
                             "epoch": epoch,
-                            "batch_count": batch_count,
                         }
 
                         self.dispatch("before_training_batch", **batch_kw)
 
-                        batch_steps = self.get_batch_steps(batch, mini_batch_chunk_size=mini_batch_chunk_size)
-
-                        # forward and backward for batch
-                        for batch_step_no, batch_step in enumerate(batch_steps):
-                            disable_gradient_sync = multi_gpu and batch_step_no < len(batch_steps) - 1
+                        # forward and backward for batches
+                        for batch_step_no, batch_step in enumerate(batches_current_optimizer_step):
+                            disable_gradient_sync = (
+                                multi_gpu and batch_step_no < len(batches_current_optimizer_step) - 1
+                            )
                             grad_sync = self.ddp_model.no_sync() if disable_gradient_sync else contextlib.nullcontext()
                             with grad_sync:
                                 # forward pass
@@ -1241,14 +1253,14 @@ class ModelTrainer(Pluggable):
                                     else:
                                         loss, datapoint_count = self.model.forward_loss(batch_step)
 
-                                batch_train_samples += datapoint_count
-                                batch_train_loss += loss.item()
+                                optimizer_train_samples += datapoint_count
+                                optimizer_train_loss += loss.item()
 
                                 self._backward(scaler.scale(loss))
 
                                 # identify dynamic embeddings (always deleted) on first sentence
                                 if dynamic_embeddings is None:
-                                    dynamic_embeddings = identify_dynamic_embeddings(batch)
+                                    dynamic_embeddings = identify_dynamic_embeddings(batch_step)
 
                                 # depending on memory mode, embeddings are moved to CPU, GPU or deleted
                                 store_embeddings(batch_step, embeddings_storage_mode, dynamic_embeddings)
@@ -1270,23 +1282,23 @@ class ModelTrainer(Pluggable):
                         scale_after = scaler.get_scale()
                         batch_kw["optimizer_was_run"] = scale_before <= scale_after
 
-                        if batch_train_samples > 0:
-                            total_train_samples += batch_train_samples
-                            train_loss = batch_train_loss / batch_train_samples
-                            self._record(MetricRecord.scalar(("train", "batch_loss"), train_loss, batch_count))
+                        if optimizer_train_samples > 0:
+                            total_train_samples += optimizer_train_samples
+                            train_loss = optimizer_train_loss / optimizer_train_samples
+                            self._record(
+                                MetricRecord.scalar(("train", "optimizer_step_loss"), train_loss, optimizer_step_count)
+                            )
                             if gradient_norm is not None:
                                 self._record(
-                                    MetricRecord.scalar(("train", "gradient_norm"), gradient_norm, batch_count)
+                                    MetricRecord.scalar(("train", "gradient_norm"), gradient_norm, optimizer_step_count)
                                 )
 
-                            epoch_train_loss += batch_train_loss
-                            epoch_train_samples += batch_train_samples
+                            epoch_train_loss += optimizer_train_loss
+                            epoch_train_samples += optimizer_train_samples
 
-                        if (batch_no + 1) % log_modulo == 0:
+                        if (batch_no // num_batches_per_optimizer_step + 1) % log_modulo == 0:
                             intermittent_loss = (
-                                epoch_train_loss / epoch_train_samples
-                                if epoch_train_samples > 0
-                                else epoch_train_samples / (batch_no + 1)
+                                epoch_train_loss / epoch_train_samples if epoch_train_samples > 0 else None
                             )
                             intermittent_loss = aggregate(intermittent_loss, np.mean)
 
@@ -1294,15 +1306,16 @@ class ModelTrainer(Pluggable):
                             samples_per_second = epoch_train_samples / (current_time - epoch_start_time)
                             samples_per_second = aggregate(samples_per_second, np.sum)
 
-                            lr_info, momentum_info = self._get_current_lr_and_momentum(batch_count)
+                            lr_info, momentum_info = self._get_current_lr_and_momentum(optimizer_step_count)
                             log.info(
                                 f"epoch {epoch}"
-                                f" - iter {batch_no + 1}/{len(batch_loader)}"
+                                f" - iter {batch_no // num_batches_per_optimizer_step + 1}/{num_optimizer_steps}"
                                 f" - loss {intermittent_loss:.8f}"
                                 f" - time (sec): {(current_time - epoch_start_time):.2f}"
                                 f" - samples/sec: {samples_per_second:.2f}"
                                 f"{lr_info}{momentum_info}"
                             )
+                        batches_current_optimizer_step = []
 
                         # - SchedulerPlugin -> do the scheduler step if one-cycle or linear decay
                         # - WeightExtractorPlugin -> extracts weights
