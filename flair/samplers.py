@@ -123,13 +123,29 @@ class ExpandingChunkSampler(FlairSampler):
 
 
 class AdaptiveBatchSamplerBaseClass:
-    # TODO: docstring
+    """Base class for adaptive batch samplers.
+
+    This class provides common functionality for adaptive batch sampling, including:
+    - Downsampling data points based on a ratio.
+    - Distributing data points across multiple GPUs.
+    - Chunking data points into batches.
+    - Shuffling batches.
+    - Saving batches to S3 for debugging.
+    """
+
     def __init__(
         self,
         seed: int = 0,
         s3_bucket: Optional[str] = None,
         s3_folder: Optional[str] = None,
     ) -> None:
+        """Initialize the base sampler.
+
+        Args:
+            seed (int): Random seed for reproducibility.
+            s3_bucket (Optional[str]): S3 bucket name for saving batches.
+            s3_folder (Optional[str]): S3 folder path for saving batches.
+        """
         self.seed = seed
         self.s3_bucket = s3_bucket
         self.s3_folder = s3_folder
@@ -142,11 +158,24 @@ class AdaptiveBatchSamplerBaseClass:
             self.rank = 0
 
     def generate_batches(self) -> None:
+        """Abstract method to generate batches. Must be implemented by subclasses."""
         raise NotImplementedError
 
     def downsample_distribute_and_chunk_indices(
         self, indices: list[int], downsample_ratio: Optional[float], shuffle: bool, epoch: int, batch_size: int
     ) -> list[list[int]]:
+        """Downsample, distribute, and chunk indices into batches.
+
+        Args:
+            indices (list[int]): List of indices, where each index corresponds to a data point in the dataset, e.g., 0 corresponds to the 0th data point.
+            downsample_ratio (Optional[float]): Ratio for downsampling data points.
+            shuffle (bool): Whether to shuffle the indices.
+            epoch (int): Current epoch number for randomness.
+            batch_size (int): Size of each batch.
+
+        Returns:
+            list[list[int]]: List of batches, where each batch is a list of indices.
+        """
         num_datapoints = len(indices)
 
         # downsample indices
@@ -178,6 +207,15 @@ class AdaptiveBatchSamplerBaseClass:
         return [indices_this_GPU[i : i + batch_size] for i in range(0, num_datapoints_per_GPU, batch_size)]
 
     def shuffle_batches(self, batches: list[list[int]], epoch: int) -> list[list[int]]:
+        """Shuffle batches.
+
+        Args:
+            batches (list[list[int]]): List of batches to shuffle.
+            epoch (int): Current epoch number for randomness.
+
+        Returns:
+            list[list[int]]: Shuffled list of batches.
+        """
         # control randomness to ensure the permutation to shuffle batches are identical across all GPUs
         g = torch.Generator()
         g.manual_seed(self.seed + epoch)
@@ -185,22 +223,35 @@ class AdaptiveBatchSamplerBaseClass:
         return [batches[i] for i in perm]
 
     def save_batches_to_s3(self, epoch: int) -> None:
+        """Save batches to S3 for debugging.
+
+        Args:
+            epoch (int): Current epoch number for naming the saved file.
+        """
         boto3.resource("s3").Object(self.s3_bucket, f"{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl").put(
             Body=pickle.dumps(self.batches)
         )
-        log.warning(
-            f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl"
-        )
+        log.info(f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl")
 
     def __iter__(self) -> Iterator[list[int]]:
+        """Return an iterator over the batches."""
         return iter(self.batches)
 
     def __len__(self) -> int:
+        """Return the number of batches."""
         return len(self.batches)
 
 
 class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
-    # TODO: docstring
+    """This sampler is designed to generate batches for the training set of a MultiCorpus.
+
+    It guarantees:
+    1. On a single CPU/GPU, each batch contains data points from the same task.
+    2. On multiple GPUs, all batches processed simultaneously across GPUs contain data points from the same task
+
+    Additionally, this sampler supports adaptive downsampling of training data for each task based on a user-provided function.
+    """
+
     def __init__(
         self,
         dataset: ConcatFlairDataset,
@@ -211,9 +262,25 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
         s3_bucket: Optional[str] = None,
         s3_folder: Optional[str] = None,
     ) -> None:
+        """Initialize the sampler.
+
+        Args:
+            dataset (ConcatFlairDataset): The dataset to sample from.
+            batch_size (int): Size of each batch.
+            downsample_ratio_func (Optional[Callable[[float], float]]): Function to compute downsample ratio.
+            seed (int): Random seed for reproducibility.
+            debug_mode (bool): Whether to enable debug mode.
+            s3_bucket (Optional[str]): S3 bucket name for saving batches.
+            s3_folder (Optional[str]): S3 folder path for saving batches.
+        """
         if not isinstance(dataset, ConcatFlairDataset):
             raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
         assert len(dataset.cummulative_sizes) == len(dataset.ids)
+        # cummulative_sizes is an attribute of ConcatFlairDataset that defines the boundaries of each dataset within the concatenated dataset.
+        # For example, if cummulative_sizes = [5, 20, 50]:
+        # - Data points from the first task start at index 0 and end at index 5 (exclusive) in the ConcatFlairDataset.
+        # - Data points from the second task start at index 5 and end at index 20 (exclusive).
+        # - Data points from the third task start at index 20 and end at index 50 (exclusive).
         self.cummulative_sizes = dataset.cummulative_sizes
         self.task_ids = dataset.ids
 
@@ -236,7 +303,13 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
             log.info(f"task_ids: {dataset.ids!s}")
 
     def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int) -> None:
-        # TODO: docstring
+        """Generate batches for the dataset.
+
+        Args:
+            prev_dev_micro_f1 (dict[str, float]): Micro F1 score on dev set from the previous epoch for each task.
+            shuffle (bool): Whether to shuffle the batches.
+            epoch (int): Current epoch number for randomness.
+        """
         self.batches = []
 
         for task_index, task_id in enumerate(self.task_ids):
@@ -246,7 +319,7 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
             downsample_ratio = None
             if self.downsample_ratio_func:
                 downsample_ratio = self.downsample_ratio_func(prev_dev_micro_f1[task_id])
-                log.warning(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
+                log.info(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
 
             self.batches += self.downsample_distribute_and_chunk_indices(
                 indices=indices_this_task,
@@ -264,7 +337,15 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
 
 
 class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
-    # TODO: docstring
+    """This sampler is designed to generate batches for the training set of a MultiCorpus.
+
+    It guarantees:
+    1. On a single CPU/GPU, each batch contains data points from the same task and with the same number of tokens.
+    2. On multiple GPUs, all batches processed simultaneously across GPUs contain data points from the same task and with the same number of tokens.
+
+    Additionally, this sampler supports adaptive downsampling of training data for each task based on a user-provided function.
+    """
+
     def __init__(
         self,
         dataset: ConcatFlairDataset,
@@ -276,13 +357,37 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
         s3_bucket: Optional[str] = None,
         s3_folder: Optional[str] = None,
     ) -> None:
+        """Initialize the sampler.
+
+        Args:
+            dataset (ConcatFlairDataset): The dataset to sample from.
+            length_dicts_for_tasks (dict[str, dict[int, list[int]]]): A dictionary where each key is a task_id, and the value is a dictionary, which maps a length to a list of indices corresponding to data points of that length.
+                For example:
+                {
+                    "task_1": {10: [0, 2], 20: [1]},
+                    "task_2": {15: [0], 25: [1, 3], 60: [2, 4]}
+                }
+                This indicates that for task_1, there are data points of length 10 at indices [0, 2] and of length 20 at indices [1].
+                Similarly, for task_2, there are data points of length 15 at indices [0] and of length 25 at indices [1, 3] and of length 60 at indices [2, 4].
+            batch_size_func (Callable[[int], int]): Function to compute batch size based on length of data points.
+            downsample_ratio_func (Optional[Callable[[float], float]]): Function to compute downsample ratio.
+            seed (int): Random seed for reproducibility.
+            debug_mode (bool): Whether to enable debug mode for logging and saving batches.
+            s3_bucket (Optional[str]): S3 bucket name for saving batches.
+            s3_folder (Optional[str]): S3 folder path for saving batches.
+        """
         if not isinstance(dataset, ConcatFlairDataset):
             raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
         assert len(dataset.cummulative_sizes) == len(dataset.ids)
+        # cummulative_sizes is an attribute of ConcatFlairDataset that defines the boundaries of each dataset within the concatenated dataset.
+        # For example, if cummulative_sizes = [5, 20, 50]:
+        # - Data points from the first task start at index 0 and end at index 5 (exclusive) in the ConcatFlairDataset.
+        # - Data points from the second task start at index 5 and end at index 20 (exclusive).
+        # - Data points from the third task start at index 20 and end at index 50 (exclusive).
         self.cummulative_sizes = dataset.cummulative_sizes
         self.task_ids = dataset.ids
 
-        # shift indices in length_dict of each task by the task's offset in dataset
+        # Adjust the indices in the length_dict of each task by adding the task's starting index in the concatenated dataset.
         task_start_idx = {}
         task_end_idx = {}
         for task_idx, task_id in enumerate(self.task_ids):
@@ -317,17 +422,32 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
 
     @staticmethod
     def apply_offset_to_list(list_of_int: list[int], offset: int) -> list[int]:
+        """Apply an offset to a list of integers.
+
+        Args:
+            list_of_int (list[int]): List of integers.
+            offset (int): Offset to apply.
+
+        Returns:
+            list[int]: List of integers with the offset applied.
+        """
         return [x + offset for x in list_of_int]
 
     def generate_batches(self, prev_dev_micro_f1: dict[str, float], shuffle: bool, epoch: int) -> None:
-        # TODO: docstring
+        """Generate batches for the dataset.
+
+        Args:
+            prev_dev_micro_f1 (dict[str, float]): Micro F1 score on dev set from the previous epoch for each task.
+            shuffle (bool): Whether to shuffle the batches.
+            epoch (int): Current epoch number for randomness.
+        """
         self.batches = []
 
         for task_id in self.task_ids:
             downsample_ratio = None
             if self.downsample_ratio_func:
                 downsample_ratio = self.downsample_ratio_func(prev_dev_micro_f1[task_id])
-                log.warning(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
+                log.info(f"For {task_id}, downsample_ratio is {downsample_ratio:.4f}")
 
             length_dict_this_task = self.length_dicts_for_tasks[task_id]
             for length, indices_this_task_this_length in length_dict_this_task.items():
