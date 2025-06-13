@@ -195,16 +195,17 @@ class AdaptiveBatchSamplerBaseClass:
             indices = [indices[i] for i in perm]
 
         # Distribute indices to each GPU
-        num_datapoints_per_GPU = (
+        num_datapoints_per_gpu = (
             num_datapoints // self.num_replicas
         )  # drop the remaining training data if it is not divisible by self.num_replicas
-        num_datapoints_per_GPU = (
-            num_datapoints_per_GPU // batch_size * batch_size
-        )  # drop the remaining training data if it is not divisible by batch_size
-        indices_this_GPU = indices[self.rank : num_datapoints_per_GPU * self.num_replicas : self.num_replicas]
+        if hasattr(self, "skip_ratio"):
+            length_of_last_batch = num_datapoints_per_gpu % batch_size
+            if length_of_last_batch < self.skip_ratio * batch_size:  # skip the last batch
+                num_datapoints_per_gpu = num_datapoints_per_gpu - length_of_last_batch
+        indices_this_gpu = indices[self.rank : num_datapoints_per_gpu * self.num_replicas : self.num_replicas]
 
         # chunk indices to batches
-        return [indices_this_GPU[i : i + batch_size] for i in range(0, num_datapoints_per_GPU, batch_size)]
+        return [indices_this_gpu[i : i + batch_size] for i in range(0, num_datapoints_per_gpu, batch_size)]
 
     def shuffle_batches(self, batches: list[list[int]], epoch: int) -> list[list[int]]:
         """Shuffle batches.
@@ -232,6 +233,14 @@ class AdaptiveBatchSamplerBaseClass:
             Body=pickle.dumps(self.batches)
         )
         log.info(f"Dump batches to s3://{self.s3_bucket}/{self.s3_folder}/batches_rank_{self.rank}_epoch_{epoch}.pkl")
+
+    def log_num_training_data(self) -> None:
+        """Log the total number of training samples this CPU/GPU will process in the current epoch.
+
+        This is especially useful for SingleTaskSingleLengthAdaptiveBatchSampler, which produces batches of varying sizes.
+        """
+        total_samples = sum(len(batch) for batch in self.batches)
+        log.info(f"CPU/GPU rank {self.rank} will train on {total_samples} samples in this epoch.")
 
     def __iter__(self) -> Iterator[list[int]]:
         """Return an iterator over the batches."""
@@ -284,7 +293,7 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
         self.cummulative_sizes = dataset.cummulative_sizes
         self.task_ids = dataset.ids
 
-        self.batch_size = batch_size
+        self._batch_size = batch_size
         self.downsample_ratio_func = downsample_ratio_func
         self.seed = seed
         self.debug_mode = debug_mode
@@ -326,14 +335,19 @@ class SingleTaskAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
                 downsample_ratio=downsample_ratio,
                 shuffle=shuffle,
                 epoch=epoch,
-                batch_size=self.batch_size,
+                batch_size=self._batch_size,
             )
 
         if shuffle:
             self.batches = self.shuffle_batches(self.batches, epoch)
 
         if self.debug_mode:
+            self.log_num_training_data()
             self.save_batches_to_s3(epoch)
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
 
 class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
@@ -351,7 +365,9 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
         dataset: ConcatFlairDataset,
         length_dicts_for_tasks: dict[str, dict[int, list[int]]],
         batch_size_func: Callable[[int], int],
+        min_batch_size: int,
         downsample_ratio_func: Optional[Callable[[float], float]] = None,
+        skip_ratio: float = 0.5,
         seed: int = 0,
         debug_mode: bool = False,
         s3_bucket: Optional[str] = None,
@@ -370,7 +386,11 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
                 This indicates that for task_1, there are data points of length 10 at indices [0, 2] and of length 20 at indices [1].
                 Similarly, for task_2, there are data points of length 15 at indices [0] and of length 25 at indices [1, 3] and of length 60 at indices [2, 4].
             batch_size_func (Callable[[int], int]): Function to compute batch size based on length of data points.
+            min_batch_size (int): The smallest integer that batch_size_func could return. This is used by LinearSchedulerPlugin.
             downsample_ratio_func (Optional[Callable[[float], float]]): Function to compute downsample ratio.
+            skip_ratio (float): Fraction threshold for dropping smaller batches.
+                If the length of a batch is less than batch_size (computed using batch_size_func) * skip_ratio, it will be dropped.
+                A lower skip_ratio (e.g. 0.3) preserves rare-length examples by retaining small batches, but underfilled batches can reduce GPU utilization.
             seed (int): Random seed for reproducibility.
             debug_mode (bool): Whether to enable debug mode for logging and saving batches.
             s3_bucket (Optional[str]): S3 bucket name for saving batches.
@@ -403,7 +423,9 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
                 assert max(self.length_dicts_for_tasks[task_id][length]) < task_end_idx[task_id]
 
         self.batch_size_func = batch_size_func
+        self._min_batch_size = min_batch_size
         self.downsample_ratio_func = downsample_ratio_func
+        self.skip_ratio = skip_ratio
         self.seed = seed
         self.debug_mode = debug_mode
         self.s3_bucket = s3_bucket
@@ -464,4 +486,9 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
             self.batches = self.shuffle_batches(self.batches, epoch)
 
         if self.debug_mode:
+            self.log_num_training_data()
             self.save_batches_to_s3(epoch)
+
+    @property
+    def min_batch_size(self) -> int:
+        return self._min_batch_size

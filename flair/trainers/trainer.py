@@ -930,7 +930,6 @@ class ModelTrainer(Pluggable):
         learning_rate: float = 5e-5,
         decoder_learning_rate: Optional[float] = None,
         num_batches_per_optimizer_step: int = 16,
-        mini_batch_size: int = 4,  # mini_batch_size is used by LinearSchedulerPlugin
         eval_batch_size: int = 16,
         max_epochs: int = 10,
         optimizer: type[torch.optim.Optimizer] = torch.optim.AdamW,
@@ -1036,6 +1035,16 @@ class ModelTrainer(Pluggable):
         train_data = self._get_train_data(train_with_dev=train_with_dev, train_with_test=train_with_test)
         dataset_size = _len_dataset(train_data)
         parameters = {"dataset_size": dataset_size, **training_parameters}
+
+        # Currently, parameters["mini_batch_size"] is used by LinearSchedulerPlugin only.
+        if isinstance(sampler, SingleTaskAdaptiveBatchSampler):
+            parameters["mini_batch_size"] = num_batches_per_optimizer_step * sampler.batch_size
+        elif isinstance(sampler, SingleTaskSingleLengthAdaptiveBatchSampler):
+            # SingleTaskSingleLengthAdaptiveBatchSampler produces batches of varying sizes.
+            # Using sampler_min_batch_size underestimates effective mini batch size, but this is fine for LinearSchedulerPlugin.
+            parameters["mini_batch_size"] = num_batches_per_optimizer_step * sampler.min_batch_size
+        else:
+            raise NotImplementedError
 
         # ensure the corpus is a MultiCorpus and has a development set, as required for fine-tuning with the customized sampler.
         if not isinstance(self.corpus, MultiCorpus):
@@ -1172,7 +1181,7 @@ class ModelTrainer(Pluggable):
             # At any point you can hit Ctrl + C to break out of training early.
             try:
                 total_train_samples = 0
-                optimizer_step_count = 0
+                total_optimizer_step_count = 0
 
                 for epoch in range(epoch + 1, max_epochs + 1):
                     log_line(log)
@@ -1182,7 +1191,7 @@ class ModelTrainer(Pluggable):
                     self.dispatch("before_training_epoch", epoch=epoch)
                     self.model.model_card["training_parameters"]["epoch"] = epoch  # type: ignore[index]
 
-                    lr_info, momentum_info = self._get_current_lr_and_momentum(optimizer_step_count)
+                    lr_info, momentum_info = self._get_current_lr_and_momentum(total_optimizer_step_count)
 
                     # if shuffle_first_epoch==False, the first epoch is not shuffled
                     shuffle_data_this_epoch = shuffle
@@ -1204,6 +1213,7 @@ class ModelTrainer(Pluggable):
                     # Learnable parameters are updated every num_batches_per_optimizer_step batches.
                     # When using SingleTaskSingleLengthAdaptiveBatchSampler, the size of each batch may vary.
                     num_optimizer_steps = math.ceil(len(batch_loader) / num_batches_per_optimizer_step)
+                    optimizer_step_count_current_epoch = 0
 
                     # log infos on training progress every `log_modulo` batches
                     log_modulo = max(1, int(num_optimizer_steps / 10))
@@ -1222,10 +1232,10 @@ class ModelTrainer(Pluggable):
 
                         optimizer_train_loss = 0.0
                         optimizer_train_samples = 0
-                        optimizer_step_count += 1
+                        total_optimizer_step_count += 1
+                        optimizer_step_count_current_epoch += 1
 
                         batch_kw = {
-                            "optimizer_step_no": batch_no // num_batches_per_optimizer_step,
                             "epoch": epoch,
                         }
 
@@ -1286,17 +1296,21 @@ class ModelTrainer(Pluggable):
                             total_train_samples += optimizer_train_samples
                             train_loss = optimizer_train_loss / optimizer_train_samples
                             self._record(
-                                MetricRecord.scalar(("train", "optimizer_step_loss"), train_loss, optimizer_step_count)
+                                MetricRecord.scalar(
+                                    ("train", "optimizer_step_loss"), train_loss, total_optimizer_step_count
+                                )
                             )
                             if gradient_norm is not None:
                                 self._record(
-                                    MetricRecord.scalar(("train", "gradient_norm"), gradient_norm, optimizer_step_count)
+                                    MetricRecord.scalar(
+                                        ("train", "gradient_norm"), gradient_norm, total_optimizer_step_count
+                                    )
                                 )
 
                             epoch_train_loss += optimizer_train_loss
                             epoch_train_samples += optimizer_train_samples
 
-                        if (batch_no // num_batches_per_optimizer_step + 1) % log_modulo == 0:
+                        if optimizer_step_count_current_epoch % log_modulo == 0:
                             intermittent_loss = (
                                 epoch_train_loss / epoch_train_samples if epoch_train_samples > 0 else None
                             )
@@ -1306,10 +1320,10 @@ class ModelTrainer(Pluggable):
                             samples_per_second = epoch_train_samples / (current_time - epoch_start_time)
                             samples_per_second = aggregate(samples_per_second, np.sum)
 
-                            lr_info, momentum_info = self._get_current_lr_and_momentum(optimizer_step_count)
+                            lr_info, momentum_info = self._get_current_lr_and_momentum(total_optimizer_step_count)
                             log.info(
                                 f"epoch {epoch}"
-                                f" - iter {batch_no // num_batches_per_optimizer_step + 1}/{num_optimizer_steps}"
+                                f" - iter {optimizer_step_count_current_epoch}/{num_optimizer_steps}"
                                 f" - loss {intermittent_loss:.8f}"
                                 f" - time (sec): {(current_time - epoch_start_time):.2f}"
                                 f" - samples/sec: {samples_per_second:.2f}"
