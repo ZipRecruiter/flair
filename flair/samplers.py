@@ -157,9 +157,7 @@ class AdaptiveBatchSamplerBaseClass:
             self.num_replicas = 1
             self.rank = 0
 
-    def generate_batches(self) -> None:
-        """Abstract method to generate batches. Must be implemented by subclasses."""
-        raise NotImplementedError
+        self.batches: list[list[int]] = []
 
     def downsample_distribute_and_chunk_indices(
         self, indices: list[int], downsample_ratio: Optional[float], shuffle: bool, epoch: int, batch_size: int
@@ -397,7 +395,7 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
             s3_folder (Optional[str]): S3 folder path for saving batches.
         """
         if not isinstance(dataset, ConcatFlairDataset):
-            raise RuntimeError("SingleTaskAdaptiveBatchSampler only supports ConcatFlairDataset!")
+            raise RuntimeError("SingleTaskSingleLengthAdaptiveBatchSampler only supports ConcatFlairDataset!")
         assert len(dataset.cummulative_sizes) == len(dataset.ids)
         # cummulative_sizes is an attribute of ConcatFlairDataset that defines the boundaries of each dataset within the concatenated dataset.
         # For example, if cummulative_sizes = [5, 20, 50]:
@@ -413,7 +411,7 @@ class SingleTaskSingleLengthAdaptiveBatchSampler(AdaptiveBatchSamplerBaseClass):
         for task_idx, task_id in enumerate(self.task_ids):
             task_start_idx[task_id] = 0 if task_idx == 0 else self.cummulative_sizes[task_idx - 1]
             task_end_idx[task_id] = self.cummulative_sizes[task_idx]  # exclusive
-        self.length_dicts_for_tasks = {}
+        self.length_dicts_for_tasks: dict[str, dict[int, list[int]]] = {}
         for task_id in self.task_ids:
             self.length_dicts_for_tasks[task_id] = {}
             for length, indices in length_dicts_for_tasks[task_id].items():
