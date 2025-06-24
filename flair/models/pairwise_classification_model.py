@@ -74,7 +74,12 @@ class TextPairClassifier(flair.nn.DefaultClassifier[TextPair, TextPair]):
     def _get_embedding_for_data_point(self, prediction_data_point: TextPair) -> torch.Tensor:
         embedding_names = self.embeddings.get_names()
         if self.embed_separately:
-            self.embeddings.embed([prediction_data_point.first, prediction_data_point.second])
+            # Compute embeddings if not already present.
+            if (
+                prediction_data_point.first.embedding.numel() == 0
+                or prediction_data_point.second.embedding.numel() == 0
+            ):
+                self.embeddings.embed([prediction_data_point.first, prediction_data_point.second])
             return torch.cat(
                 [
                     prediction_data_point.first.get_embedding(embedding_names),
