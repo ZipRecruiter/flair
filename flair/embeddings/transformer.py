@@ -222,6 +222,11 @@ def document_max_pooling(sentence_hidden_states: torch.Tensor, sentence_lengths:
     return result
 
 
+@torch.jit.script_if_tracing
+def document_last_pooling(sentence_hidden_states: torch.Tensor, sentence_lengths: torch.Tensor) -> torch.Tensor:
+    return sentence_hidden_states[torch.arange(sentence_hidden_states.shape[0]), sentence_lengths]
+
+
 def _legacy_reconstruct_word_ids(
     embedding: "TransformerBaseEmbeddings", flair_tokens: list[list[str]]
 ) -> list[list[Optional[int]]]:
@@ -1034,7 +1039,7 @@ class TransformerEmbeddings(TransformerBaseEmbeddings):
         layers: str = "-1",
         layer_mean: bool = True,
         subtoken_pooling: Literal["first", "last", "first_last", "mean"] = "first",
-        cls_pooling: Literal["cls", "max", "mean"] = "cls",
+        cls_pooling: Literal["cls", "max", "mean", "last"] = "cls",
         is_token_embedding: bool = True,
         is_document_embedding: bool = True,
         allow_long_sentences: bool = False,
@@ -1204,7 +1209,7 @@ class TransformerEmbeddings(TransformerBaseEmbeddings):
         self.token_embedding = is_token_embedding
         self.document_embedding = is_document_embedding
 
-        if self.document_embedding and cls_pooling not in ["cls", "max", "mean"]:
+        if self.document_embedding and cls_pooling not in ["cls", "max", "mean", "last"]:
             raise ValueError(f"Document Pooling operation `{cls_pooling}` is not defined for TransformerEmbedding")
 
         if self.token_embedding and subtoken_pooling not in ["first", "last", "first_last", "mean"]:
@@ -1478,6 +1483,8 @@ class TransformerEmbeddings(TransformerBaseEmbeddings):
                     document_embeddings = document_mean_pooling(sentence_hidden_states, sub_token_lengths)
                 elif self.cls_pooling == "max":
                     document_embeddings = document_max_pooling(sentence_hidden_states, sub_token_lengths)
+                elif self.cls_pooling == "last":
+                    document_embeddings = document_last_pooling(sentence_hidden_states, sub_token_lengths)
                 else:
                     raise ValueError(f"cls pooling method: `{self.cls_pooling}` is not implemented")
             result["document_embeddings"] = document_embeddings

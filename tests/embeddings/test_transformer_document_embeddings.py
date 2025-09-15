@@ -41,7 +41,7 @@ def test_if_loaded_embeddings_have_all_attributes(tasks_base_path):
     assert model.embeddings.use_context_separator == loaded_single_task.embeddings.use_context_separator
 
 
-@pytest.mark.parametrize("cls_pooling", ["cls", "mean", "max"])
+@pytest.mark.parametrize("cls_pooling", ["cls", "mean", "max", "last"])
 def test_cls_pooling(cls_pooling):
     embeddings = TransformerDocumentEmbeddings(
         model="distilbert-base-uncased",
