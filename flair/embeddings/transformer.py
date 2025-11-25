@@ -594,11 +594,24 @@ class TransformerBaseEmbeddings(Embeddings[Sentence]):
                 self.tokenizer.model_max_length,
                 self.tokenizer.pad_token_id,
             )
-            sub_token_lengths = (unpacked_ids != self.tokenizer.pad_token_id).sum(dim=1)
+            if "attention_mask" in batch_encoding:
+                unpacked_attention_mask = combine_strided_tensors(
+                    batch_encoding["attention_mask"].to(device, non_blocking=True),
+                    model_kwargs["overflow_to_sample_mapping"],
+                    self.stride // 2,
+                    self.tokenizer.model_max_length,
+                    0,  # pad with 0
+                )
+                sub_token_lengths = unpacked_attention_mask.sum(dim=1)
+            else:
+                sub_token_lengths = (unpacked_ids != self.tokenizer.pad_token_id).sum(dim=1)
             padded_tokens = [flair_tokens[i] for i in cpu_overflow_to_sample_mapping] if flair_tokens else None
         else:
             cpu_overflow_to_sample_mapping = None
-            sub_token_lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1)
+            if "attention_mask" in batch_encoding:
+                sub_token_lengths = batch_encoding["attention_mask"].sum(dim=1)
+            else:
+                sub_token_lengths = (input_ids != self.tokenizer.pad_token_id).sum(dim=1)
             padded_tokens = flair_tokens
 
         if self.document_embedding and not (self.cls_pooling == "cls" and self.initial_cls_token):
